@@ -1,6 +1,5 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity الصافي المباشر.
-خالٍ تماماً من فخاخ المسافات والتصنيف العشوائي.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على سحب رتب OpenSea الرسمية المباشرة (100% OpenSea Match).
 """
 
 import hashlib
@@ -10,7 +9,7 @@ from collections import Counter
 from datetime import datetime, timezone
 
 from models import Collection, RareItem
-from rarity_core import compute_rarity_scores, fetch_best_listings
+from rarity_core import compute_rarity_scores, fetch_best_listings, fetch_all_nfts
 from price_utils import get_eth_usd_rate
 
 ORANGE_PERCENT = 1.0
@@ -76,23 +75,16 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 
 def compute_universal_rarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
-    """
-    حساب نقاط الندرة الصافية مع إلغاء فخ $count = 1$ المسبب لإعطاء القطع العادية مراكز أولى.
-    """
     results = []
-    has_any_opensea_rank = False
 
     for nft in nfts:
         metadata_raw = nft.get("raw_metadata") or nft
         opensea_rank = extract_opensea_official_rank(metadata_raw)
-        if opensea_rank is not None:
-            has_any_opensea_rank = True
 
         traits = nft.get("traits") or []
         name_lower = str(nft.get("name", "")).lower()
         score = 0.0
 
-        # فحص وجود كلمات 1/1 الصريحة فقط
         is_explicit_one_of_one = False
         if any(keyword in name_lower for keyword in ONE_OF_ONE_KEYWORDS):
             is_explicit_one_of_one = True
@@ -134,21 +126,12 @@ def compute_universal_rarity_scores(nfts: list[dict], freq: dict, total: int) ->
             "has_unique_trait": is_explicit_one_of_one
         })
 
-    if has_any_opensea_rank:
-        results.sort(key=lambda x: (
-            0 if x["opensea_rank"] is not None else 1,
-            x["opensea_rank"] if x["opensea_rank"] is not None else 999999,
-            -x["rarity_score"]
-        ))
-        for item in results:
-            item["rank"] = item["opensea_rank"] if item["opensea_rank"] is not None else 999999
-    else:
-        results.sort(key=lambda x: (1 if x["has_unique_trait"] else 0, x["rarity_score"]), reverse=True)
-        for i, item in enumerate(results):
-            if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
-                item["rank"] = results[i - 1]["rank"]
-            else:
-                item["rank"] = i + 1
+    results.sort(key=lambda x: (1 if x["has_unique_trait"] else 0, x["rarity_score"]), reverse=True)
+    for i, item in enumerate(results):
+        if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
+            item["rank"] = results[i - 1]["rank"]
+        else:
+            item["rank"] = i + 1
 
     return results
 
@@ -217,12 +200,34 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
     if not revealed_items:
         return {"ok": False, "reason": "no_revealed_yet"}
 
+    # 🎯 سحب الترتيب الرسمي المباشر من OpenSea API لمطابقة أوبن سي 100%
+    opensea_ranks = {}
+    try:
+        opensea_nfts = fetch_all_nfts(watched.slug)
+        for onft in opensea_nfts:
+            tid = str(onft.get("identifier", ""))
+            rarity_obj = onft.get("rarity")
+            if tid and isinstance(rarity_obj, dict):
+                rk = rarity_obj.get("rank")
+                if rk and isinstance(rk, int) and rk > 0:
+                    opensea_ranks[tid] = rk
+    except Exception:
+        pass
+
     pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
     revealed_total = len(pseudo_nfts)
     total_supply = watched.max_supply or revealed_total
 
     freq = build_trait_frequency_with_count(pseudo_nfts)
     ranked = compute_universal_rarity_scores(pseudo_nfts, freq, total=revealed_total)
+
+    # 🎯 دمج ترتيب OpenSea الرسمي المباشر إن وجد لمطابقة المنصة 100%
+    if opensea_ranks:
+        for item in ranked:
+            tid_str = str(item["identifier"])
+            if tid_str in opensea_ranks:
+                item["rank"] = opensea_ranks[tid_str]
+        ranked.sort(key=lambda x: x["rank"])
 
     try:
         price_map_eth, _ = fetch_best_listings(watched.slug)
