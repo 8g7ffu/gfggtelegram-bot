@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>رادار الندرة</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Arial, sans-serif;
+            background: #0d0d14; color: #e8e8f0; margin: 0; padding: 16px;
+        }
+        h1 { font-size: 1.4rem; margin-bottom: 4px; }
+        h2 { font-size: 1.05rem; margin: 28px 0 10px; color: #a29bfe; }
+        .subtitle { color: #8888a0; font-size: 0.85rem; margin-bottom: 20px; }
+        .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; }
+        .add-link {
+            display: inline-block; background: #6c5ce7; color: white;
+            text-decoration: none; padding: 10px 18px; border-radius: 10px;
+            font-weight: bold; font-size: 0.9rem;
+        }
+        .collection-card {
+            background: #16161f; border: 1px solid #2a2a3a;
+            border-radius: 14px; padding: 16px; margin-bottom: 18px;
+        }
+        .collection-header {
+            display: flex; justify-content: space-between; align-items: center;
+            flex-wrap: wrap; gap: 6px; margin-bottom: 6px;
+        }
+        .collection-name { font-size: 1.1rem; font-weight: bold; }
+        .collection-name a { color: #a29bfe; text-decoration: none; }
+        .progress-line { color: #7a7a90; font-size: 0.78rem; margin-bottom: 10px; }
+        .progress-bar-bg { background: #22222f; border-radius: 6px; height: 6px; margin-bottom: 12px; overflow: hidden; }
+        .progress-bar-fill { background: #6c5ce7; height: 100%; }
+        .rare-list { list-style: none; padding: 0; margin: 0; }
+        .rare-item {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 8px 0; border-top: 1px solid #22222f; font-size: 0.88rem; flex-wrap: wrap; gap: 4px;
+        }
+        .rare-item:first-child { border-top: none; }
+        .rare-rank { font-weight: bold; min-width: 34px; font-size: 0.95rem; }
+        .rare-rank.orange { color: #ff8c1a; }
+        .rare-rank.pink { color: #ff5ec4; }
+        .rare-name { flex: 1; color: #d8d8e8; }
+        .rare-price { font-size: 0.8rem; white-space: nowrap; margin-inline-start: 6px; transition: color 0.3s; }
+        .rare-price.is-listed { color: #6ee7b7; font-weight: bold; }
+        .rare-price.not-listed { color: #7a7a90; }
+        .copy-btn {
+            background: #22223a; color: #a29bfe; border: 1px solid #3a3a5a;
+            border-radius: 8px; padding: 5px 10px; font-size: 0.78rem;
+            margin-inline-start: 8px; white-space: nowrap; cursor: pointer;
+        }
+        .copy-btn.copied { background: #1a4a2a; color: #6ee7b7; border-color: #2a6a3a; }
+        .close-btn {
+            background: transparent; color: #7a7a90; border: none;
+            font-size: 1rem; cursor: pointer; padding: 2px 8px; width: auto;
+        }
+        .close-btn:hover { color: #ff6b6b; }
+        .collection-header form { display: inline; width: auto; }
+        .empty-state { color: #7a7a90; text-align: center; padding: 30px 10px; font-size: 0.9rem; }
+        .waiting-note {
+            background: #2a2410; border: 1px solid #6a5a1a; border-radius: 10px;
+            padding: 12px; font-size: 0.85rem; color: #e0c85a; text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎯 رادار الندرة</h1>
+    <div class="subtitle">تحديث لحظي ثوانٍ · 🟠 برتقالي = أندر 1% · 🩷 وردي = أندر 5% · المصدر: البلوكشين مباشرة</div>
+
+    <div class="btn-row">
+        <a class="add-link" href="/add{% if token %}?token={{ token }}{% endif %}">+ إضافة مينت</a>
+    </div>
+
+    {% if not collections %}
+    <div class="empty-state">لا توجد مجموعات مضافة بعد.</div>
+    {% endif %}
+
+    {% for c in collections %}
+    {% set shown_items = c.rare_items | list %}
+    <div class="collection-card">
+        <div class="collection-header">
+            <div class="collection-name"><a href="{{ c.opensea_url }}" target="_blank">{{ c.name }}</a></div>
+            <form method="POST" action="/delete_collection/{{ c.id }}" onsubmit="return confirm('حذف هذي المجموعة نهائيًا؟');">
+                <input type="hidden" name="token" value="{{ token }}">
+                <button type="submit" class="close-btn">✕</button>
+            </form>
+        </div>
+        <div class="progress-line">
+            انكشف {{ c.revealed_count }} من {{ c.total_items }} قطعة
+            ({{ ((c.revealed_count / c.total_items * 100) if c.total_items else 0) | round(1) }}%)
+            · آخر تحديث {{ c.computed_at.strftime('%H:%M:%S') if c.computed_at else '' }}
+        </div>
+        <div class="progress-bar-bg">
+            <div class="progress-bar-fill" style="width: {{ ((c.revealed_count / c.total_items * 100) if c.total_items else 0) }}%;"></div>
+        </div>
+
+        {% if c.revealed_count == 0 %}
+        <div class="waiting-note">⏳ لم تُكتشف الندرة بعد — نراقب العقد وننتظر أول كشف.</div>
+        {% elif not shown_items %}
+        <div class="empty-state">لا توجد قطع بتصنيف برتقالي/وردي في القطع المنكشفة حالياً.</div>
+        {% else %}
+        <ul class="rare-list">
+            {% for item in shown_items %}
+            <li class="rare-item">
+                <span class="rare-rank {{ item.tier }}">#{{ item.rank }}</span>
+                <span class="rare-name">{{ item.name }}</span>
+                <span class="rare-price {% if item.price_usd is not none %}is-listed{% else %}not-listed{% endif %}" id="price-{{ item.id }}">
+                    {% if item.price_usd is not none %}${{ "%.2f"|format(item.price_usd) }}{% else %}غير مسعّر{% endif %}
+                </span>
+                <button class="copy-btn" data-url="{{ item.opensea_url }}" onclick="copyLink(this)">نسخ 📋</button>
+            </li>
+            {% endfor %}
+        </ul>
+        {% endif %}
+    </div>
+    {% endfor %}
+
+    <script>
+        function copyLink(btn) {
+            const url = btn.getAttribute('data-url');
+            navigator.clipboard.writeText(url).then(() => {
+                const original = btn.textContent;
+                btn.textContent = 'تم النسخ ✅';
+                btn.classList.add('copied');
+                setTimeout(() => { btn.textContent = original; btn.classList.remove('copied'); }, 1500);
+            });
+        }
+
+        // تحديث الأسعار خفيف للغاية بالخلفية كل 8 ثوانٍ دون إعادة تحميل الصفحة
+        async function updateLivePrices() {
+            try {
+                const resp = await fetch('/api/prices');
+                if (!resp.ok) return;
+                const prices = await resp.json();
+
+                for (const [itemId, data] of Object.entries(prices)) {
+                    const priceEl = document.getElementById(`price-${itemId}`);
+                    if (priceEl) {
+                        priceEl.textContent = data.price_usd;
+                        if (data.is_listed) {
+                            priceEl.className = "rare-price is-listed";
+                        } else {
+                            priceEl.className = "rare-price not-listed";
+                        }
+                    }
+                }
+            } catch (err) {
+                // يتجاهل أي خطأ بسيط بالشبكة دون توقف الصفحة
+            }
+        }
+
+        setInterval(updateLivePrices, 8000);
+    </script>
+</body>
+</html>
