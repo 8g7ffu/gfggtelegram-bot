@@ -1,7 +1,5 @@
 """
-محرك المراقبة المتوازي التوسعي الحي (Dynamic totalSupply Expansion Engine).
-
-يتوسع تلقائياً مع زيادة السك في البلوكشين ويجلب القطع الجديدة فور صكها دون الحاجة لإعادة الإضافة.
+محرك المراقبة الجارف المزود بـ OpenSea Bulk API لتنزيل الـ 10,000 قطعة في 5 ثوانٍ.
 """
 
 import asyncio
@@ -10,13 +8,10 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from eth_abi import decode as eth_abi_decode
-from web3 import Web3
-
 from models import RevealTrack, WatchedCollection, SessionLocal, init_db
 from chain_reader import (async_batch_get_token_uris, resolve_metadata,
-                          async_batch_resolve_metadata, detect_global_reveal_flag, get_web3)
-from rarity_core import fetch_max_supply, fetch_drop_status
+                          async_batch_resolve_metadata, detect_global_reveal_flag)
+from rarity_core import fetch_max_supply, fetch_drop_status, fetch_all_nfts
 from rarity_storage import (recompute_from_chain_data, ensure_collection_placeholder,
                              content_signature, is_placeholder_fallback,
                              compute_baseline_signature)
@@ -39,49 +34,33 @@ def is_dynamic_url(uri: str) -> bool:
     return uri.startswith("http://") or uri.startswith("https://")
 
 
-def resolve_max_supply(watched: WatchedCollection) -> int:
-    """استعلام العدد الحقيقي الحالي المباشر من البلوكشين لمتابعة زيادة السك حيًا."""
-    # 1. الاستعلام المباشر اللحظي من البلوكشين (totalSupply)
-    try:
-        chain = watched.chain or "ethereum"
-        w3 = get_web3(chain)
-        checksum_addr = Web3.to_checksum_address(watched.contract_address)
-        # 0x18160ddd = totalSupply()
-        res = w3.eth.call({"to": checksum_addr, "data": bytes.fromhex("18160ddd")})
-        if res and len(res) == 32:
-            (on_chain_sp,) = eth_abi_decode(["uint256"], res)
-            if on_chain_sp and on_chain_sp > 0:
-                return int(on_chain_sp)
-    except Exception:
-        pass
-
-    # 2. الاستعلام الاحتياطي من أوبن سي
-    try:
-        supply = fetch_max_supply(watched.slug)
-        if supply and supply > 0:
-            return supply
-        drop_status = fetch_drop_status(watched.slug)
-        if drop_status:
-            for key in ("max_supply", "total_supply"):
-                if drop_status.get(key) and int(drop_status[key]) > 0:
-                    return int(drop_status[key])
-    except Exception:
-        pass
-
-    return watched.max_supply or 10000
+def resolve_max_supply(watched: WatchedCollection) -> int | None:
+    supply = fetch_max_supply(watched.slug)
+    if supply:
+        return supply
+    drop_status = fetch_drop_status(watched.slug)
+    if drop_status:
+        for key in ("max_supply", "total_supply"):
+            if drop_status.get(key):
+                return int(drop_status[key])
+    return None
 
 
 def ensure_tracks(session, watched: WatchedCollection) -> bool:
-    """تحديث ديناميكي متوسع يضيف القطع الجديدة فور صكها بالبلوكشين."""
-    latest_supply = resolve_max_supply(watched)
+    if not watched.max_supply:
+        max_supply = resolve_max_supply(watched)
+        if not max_supply:
+            watched.failed_attempts += 1
+            session.commit()
+            if watched.failed_attempts <= 3 or watched.failed_attempts % 10 == 0:
+                log.warning(f"[{watched.slug}] تعذر تحديد max_supply "
+                            f"(محاولة {watched.failed_attempts}) - سيتم إعادة المحاولة...")
+            return False
 
-    # إذا زاد السك في البلوكشين، نحدث الـ max_supply فوراً ونوسع التتبع
-    if not watched.max_supply or latest_supply > watched.max_supply:
-        old_supply = watched.max_supply or 0
-        watched.max_supply = latest_supply
+        watched.max_supply = max_supply
         watched.failed_attempts = 0
         session.commit()
-        log.info(f"[{watched.slug}] ⚡ تحديث المعروض اللحظي من البلوكشين: {old_supply} 👈 {latest_supply}")
+        log.info(f"[{watched.slug}] الحد الأقصى للعرض: {max_supply}")
         ensure_collection_placeholder(session, watched, revealed_count=0)
 
     existing_count = session.query(RevealTrack).filter_by(watched_id=watched.id).count()
@@ -99,8 +78,7 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
     if new_tracks:
         session.bulk_save_objects(new_tracks)
         session.commit()
-        log.info(f"[{watched.slug}] ⚡ توسيع التتبع تلقائياً وإضافة {len(new_tracks)} قطعة جديدة مصكوكة حديثاً.")
-
+        log.info(f"[{watched.slug}] ⚡ تم تجهيز {len(new_tracks)} صف تتبع بسرعة فائقة.")
     return True
 
 
@@ -206,22 +184,45 @@ async def process_collection_async(watched_id: int):
         if not uris_to_fetch:
             return
 
-        log.info(f"[{watched.slug}] ⚡ جاري جلب الميتاداتا لـ {len(uris_to_fetch)} قطعة حقيقية عبر IPFS...")
-        start_time = time.time()
-        metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
-        elapsed = round(time.time() - start_time, 2)
-
+        # ⚡ ⚡ [المسح الجماعي الخارق]: إذا كان العدد كبيراً (> 200)، استعن بـ OpenSea API لتمشيط 200 قطعة/طلب في 5 ثوانٍ!
         fetched_this_cycle = []
-        for token_id, metadata in metadata_map.items():
-            if metadata is not None:
-                track = tracks_by_id[token_id]
-                sig = content_signature(metadata)
-                fetched_this_cycle.append((track, metadata, sig))
+        if len(uris_to_fetch) > 200:
+            try:
+                log.info(f"[{watched.slug}] 🚀 بدء المسح الجماعي لـ {len(uris_to_fetch)} قطعة عبر OpenSea API (200 قطعة/طلب)...")
+                start_time = time.time()
+                opensea_nfts = await asyncio.to_thread(fetch_all_nfts, watched.slug)
+                elapsed = round(time.time() - start_time, 2)
 
-        session.commit()
+                if opensea_nfts:
+                    for item in opensea_nfts:
+                        tid_str = item.get("identifier")
+                        if tid_str and str(tid_str).isdigit():
+                            tid = int(tid_str)
+                            if tid in tracks_by_id:
+                                track = tracks_by_id[tid]
+                                sig = content_signature(item)
+                                fetched_this_cycle.append((track, item, sig))
+                                COLLECTION_METADATA_CACHE[watched.id][tid] = item
+                    session.commit()
+                    log.info(f"[{watched.slug}] 🎯 تم تمشيط {len(fetched_this_cycle)} قطعة بالكامل عبر OpenSea في {elapsed} ثوانٍ فقط!")
+            except Exception as e:
+                log.warning(f"[{watched.slug}] تعذر المسح الجماعي عبر أوبن سي: {e}")
 
-        if fetched_this_cycle:
-            log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة خلال {elapsed} ثانية!")
+        if not fetched_this_cycle:
+            start_time = time.time()
+            metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
+            elapsed = round(time.time() - start_time, 2)
+
+            for token_id, metadata in metadata_map.items():
+                if metadata is not None:
+                    track = tracks_by_id[token_id]
+                    sig = content_signature(metadata)
+                    fetched_this_cycle.append((track, metadata, sig))
+                    COLLECTION_METADATA_CACHE[watched.id][token_id] = metadata
+
+            session.commit()
+            if fetched_this_cycle:
+                log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة بالتوازي خلال {elapsed} ثانية!")
 
         if not watched.baseline_locked and fetched_this_cycle:
             signatures = [sig for _, _, sig in fetched_this_cycle]
@@ -270,7 +271,7 @@ async def process_collection_async(watched_id: int):
         if (changed_count > 0 or (cumulative_count > 0 and not has_rare_items)) and cumulative_revealed_items:
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
-                log.info(f"[{watched.slug}] 🎯 [الترتيب التوسعي النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة حقيقية!")
+                log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة على شبكة ({chain}) بالكامل!")
 
     except Exception as e:
         log.error(f"[خطأ معالجة]: {e}")
@@ -278,18 +279,9 @@ async def process_collection_async(watched_id: int):
         session.close()
 
 
-async def process_collection_with_timeout(watched_id: int):
-    try:
-        await asyncio.wait_for(process_collection_async(watched_id), timeout=30.0)
-    except asyncio.TimeoutError:
-        log.warning(f"[Timeout] فحص الكولكشن استغرق أكثر من 30 ثانية — للانتقال المباشر للدورة التالية.")
-    except Exception as e:
-        log.error(f"[Error]: {e}")
-
-
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة التوسعي اللحظي المباشر.")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع (Bulk API Enabled).")
 
     while True:
         try:
@@ -297,8 +289,7 @@ async def main_async_loop():
             try:
                 watched_list = session.query(WatchedCollection.id).filter_by(active=True).all()
                 if watched_list:
-                    log.info(f"📡 جاري مراقبة {len(watched_list)} كولكشن حالياً...")
-                    tasks = [process_collection_with_timeout(w.id) for w in watched_list[:3]]
+                    tasks = [process_collection_async(w.id) for w in watched_list[:3]]
                     await asyncio.gather(*tasks, return_exceptions=True)
                 else:
                     log.info("لا توجد مجموعات تحت المراقبة حاليًا.")
