@@ -1,1 +1,51 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>إضافة مينت - رادار الندرة</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Arial, sans-serif; background: #0d0d14; color: #e8e8f0; margin: 0; padding: 24px 16px; }
+        h1 { font-size: 1.2rem; }
+        .back { color: #a29bfe; text-decoration: none; font-size: 0.85rem; }
+        form { margin-top: 24px; }
+        input[type=text] {
+            width: 100%; padding: 14px; border-radius: 10px; border: 1px solid #3a3a4a;
+            background: #16161f; color: #e8e8f0; font-size: 1rem; margin-bottom: 14px;
+        }
+        button {
+            width: 100%; padding: 14px; border-radius: 10px; border: none;
+            background: #6c5ce7; color: white; font-size: 1rem; font-weight: bold;
+        }
+        .hint { color: #7a7a90; font-size: 0.8rem; margin-top: 6px; }
+        .warn { background: #3a1a1a; border: 1px solid #9a3a3a; border-radius: 10px; padding: 12px; font-size: 0.85rem; }
+        .info { background: #1a2a4a; border: 1px solid #3a5a9a; border-radius: 10px; padding: 12px; font-size: 0.85rem; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <a class="back" href="/">← رجوع للوحة التحكم</a>
+    <h1>+ إضافة مينت</h1>
 
+    <div class="info">
+        الصق رابط أي مجموعة من OpenSea — سواء لسا تُسك الآن أو خلص سكها بالكامل.
+        النظام يكتشف الحالة تلقائيًا: لو لسا يسك، يبدأ مراقبته لحظيًا. لو خلص، يحسب الندرة فورًا.
+    </div>
+
+    {% if error %}
+    <div class="warn">⚠️ {{ error }}</div>
+    {% endif %}
+
+    {% if admin_token_set and not token_ok %}
+    <div class="warn">⚠️ هذه الصفحة محمية. أضف <code>?token=كلمة_المرور</code> بآخر الرابط للوصول.</div>
+    {% else %}
+    <form method="POST" action="/submit">
+        <input type="text" name="link" placeholder="رابط المجموعة أو اسمها (slug)" required>
+        <div class="hint">مثال: https://opensea.io/collection/hoodiliosnft أو hoodiliosnft فقط</div>
+        {% if admin_token_set %}
+        <input type="hidden" name="token" value="{{ request.args.get('token', '') }}">
+        {% endif %}
+        <button type="submit">إضافة واكتشاف تلقائي</button>
+    </form>
+    {% endif %}
+</body>
+</html>
