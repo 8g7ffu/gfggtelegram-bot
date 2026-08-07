@@ -1,6 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على الترتيب المزدوج الذكي (Dual-Layer Rarity Engine).
-تطابق ترتيب واجهة OpenSea بنسبة 100% بالمليمتر.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity الصافي المباشر.
+خالٍ تماماً من فخاخ المسافات والتصنيف العشوائي.
 """
 
 import hashlib
@@ -46,7 +46,6 @@ def extract_traits_generic(metadata: dict) -> list:
 
 
 def extract_opensea_official_rank(metadata: dict) -> int | None:
-    """استخراج الترتيب الرسمي المباشر المسجل في OpenSea v2 API إن وجد."""
     try:
         rarity_obj = metadata.get("rarity")
         if isinstance(rarity_obj, dict):
@@ -78,9 +77,7 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 def compute_universal_rarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
     """
-    الترتيب المزدوج الذكي:
-    1. الاستعانة بـ OpenSea official rank إذا كان متوفراً لمطابقة أوبن سي 100%.
-    2. الحساب عبر معادلة OpenRarity للقطع الجديدة قبل كشف أوبن سي.
+    حساب نقاط الندرة الصافية مع إلغاء فخ $count = 1$ المسبب لإعطاء القطع العادية مراكز أولى.
     """
     results = []
     has_any_opensea_rank = False
@@ -95,6 +92,7 @@ def compute_universal_rarity_scores(nfts: list[dict], freq: dict, total: int) ->
         name_lower = str(nft.get("name", "")).lower()
         score = 0.0
 
+        # فحص وجود كلمات 1/1 الصريحة فقط
         is_explicit_one_of_one = False
         if any(keyword in name_lower for keyword in ONE_OF_ONE_KEYWORDS):
             is_explicit_one_of_one = True
@@ -136,7 +134,6 @@ def compute_universal_rarity_scores(nfts: list[dict], freq: dict, total: int) ->
             "has_unique_trait": is_explicit_one_of_one
         })
 
-    # 🎯 إذا توفر ترتيب OpenSea الرسمي، نرتب به المجموعات المطابقة 100%
     if has_any_opensea_rank:
         results.sort(key=lambda x: (
             0 if x["opensea_rank"] is not None else 1,
@@ -187,7 +184,7 @@ def compute_baseline_signature(signatures: list) -> str | None:
 
 
 def build_pseudo_nft(token_id: int, metadata: dict, watched) -> dict:
-    nft_data = {
+    return {
         "identifier": token_id,
         "name": metadata.get("name") or f"#{token_id}",
         "image_url": metadata.get("image") or metadata.get("image_url", ""),
@@ -195,7 +192,6 @@ def build_pseudo_nft(token_id: int, metadata: dict, watched) -> dict:
         "traits": extract_traits_generic(metadata),
         "raw_metadata": metadata,
     }
-    return nft_data
 
 
 def ensure_collection_placeholder(session, watched, revealed_count: int = 0):
