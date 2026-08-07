@@ -1,0 +1,10 @@
+flask>=3.0.0
+gunicorn>=21.2.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+requests>=2.31.0
+aiohttp>=3.9.0
+websockets>=12.0
+python-dotenv>=1.0.0
+web3>=6.15.0
+eth_abi>=4.2.0
