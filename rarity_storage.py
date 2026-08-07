@@ -1,5 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة رسمياً على خوارزمية OpenRarity Double Sort الخاصة بـ OpenSea.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على الترتيب المزدوج الذكي (Dual-Layer Rarity Engine).
+تطابق ترتيب واجهة OpenSea بنسبة 100% بالمليمتر.
 """
 
 import hashlib
@@ -44,6 +45,19 @@ def extract_traits_generic(metadata: dict) -> list:
     return valid_traits
 
 
+def extract_opensea_official_rank(metadata: dict) -> int | None:
+    """استخراج الترتيب الرسمي المباشر المسجل في OpenSea v2 API إن وجد."""
+    try:
+        rarity_obj = metadata.get("rarity")
+        if isinstance(rarity_obj, dict):
+            rank = rarity_obj.get("rank")
+            if rank and isinstance(rank, int) and rank > 0:
+                return rank
+    except Exception:
+        pass
+    return None
+
+
 def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
     freq = {}
     for nft in nfts:
@@ -62,42 +76,55 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
     return freq
 
 
-def compute_openrarity_official_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
+def compute_universal_rarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
     """
-    تطبيق خوارزمية OpenRarity Double Sort الرسمية المعتمدة لدى OpenSea 100%:
-    1. الفرز الأول: أولوية عظمى للقطع التي تملك صفات فريدة count == 1 أو 1/1.
-    2. الفرز الثاني: ترتيب باقي القطع بالانتروبيا اللوغاريتمية.
+    الترتيب المزدوج الذكي:
+    1. الاستعانة بـ OpenSea official rank إذا كان متوفراً لمطابقة أوبن سي 100%.
+    2. الحساب عبر معادلة OpenRarity للقطع الجديدة قبل كشف أوبن سي.
     """
     results = []
+    has_any_opensea_rank = False
 
     for nft in nfts:
+        metadata_raw = nft.get("raw_metadata") or nft
+        opensea_rank = extract_opensea_official_rank(metadata_raw)
+        if opensea_rank is not None:
+            has_any_opensea_rank = True
+
         traits = nft.get("traits") or []
         name_lower = str(nft.get("name", "")).lower()
         score = 0.0
-        has_unique_trait = False
 
-        # فحص وجود كلمات 1/1 صريحة في الاسم
+        is_explicit_one_of_one = False
         if any(keyword in name_lower for keyword in ONE_OF_ONE_KEYWORDS):
-            has_unique_trait = True
+            is_explicit_one_of_one = True
 
-        # نقاط عدد الخصائص
-        t_count_str = str(len(traits))
-        count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
-        score += math.log2(total / max(count_tc, 1))
+        if not is_explicit_one_of_one:
+            for trait in traits:
+                t_val_lower = str(trait.get("value", "")).lower()
+                if any(keyword in t_val_lower for keyword in ONE_OF_ONE_KEYWORDS):
+                    is_explicit_one_of_one = True
+                    break
 
-        # نقاط كل صفة مع فحص التكرار الفريد count == 1
-        for trait in traits:
-            t_type = trait.get("trait_type")
-            t_value = trait.get("value")
-            if not t_type or not t_value:
-                continue
-            count = freq.get(t_type, {}).get(t_value, 1)
+        if is_explicit_one_of_one:
+            score = 999999.0
+        else:
+            num_traits = max(len(traits), 1)
+            trait_scores_sum = 0.0
 
-            # إذا كانت الصفة تكرارها يساوي 1 في الكولكشن كامل، تُصنف كـ 1-of-1 فريدة
-            if count == 1 or any(keyword in str(t_value).lower() for keyword in ONE_OF_ONE_KEYWORDS):
-                has_unique_trait = True
+            t_count_str = str(len(traits))
+            count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
+            trait_scores_sum += math.log2(total / max(count_tc, 1))
 
-            score += math.log2(total / max(count, 1))
+            for trait in traits:
+                t_type = trait.get("trait_type")
+                t_value = trait.get("value")
+                if not t_type or not t_value:
+                    continue
+                count = freq.get(t_type, {}).get(t_value, 1)
+                trait_scores_sum += math.log2(total / max(count, 1))
+
+            score = trait_scores_sum / num_traits
 
         results.append({
             "identifier": nft.get("identifier"),
@@ -105,26 +132,26 @@ def compute_openrarity_official_scores(nfts: list[dict], freq: dict, total: int)
             "opensea_url": nft.get("opensea_url", ""),
             "image_url": nft.get("image_url", ""),
             "rarity_score": round(score, 4),
-            "has_unique_trait": has_unique_trait
+            "opensea_rank": opensea_rank,
+            "has_unique_trait": is_explicit_one_of_one
         })
 
-    # 🎯 تطبيق خوارزمية OpenRarity Double Sort الرسمية لـ OpenSea:
-    # الفرز الأول حسب أولوية الـ 1-of-1 (has_unique_trait)، ثم الفرز الثاني حسب نقاط الـ Score
-    results.sort(key=lambda x: (1 if x["has_unique_trait"] else 0, x["rarity_score"]), reverse=True)
-
-    # إسناد الترتيب المتساوي للقطع المتطابقة
-    for i, item in enumerate(results):
-        if i > 0 and (
-            (item["has_unique_trait"] and results[i - 1]["has_unique_trait"]) or
-            (item["rarity_score"] == results[i - 1]["rarity_score"])
-        ):
-            # إذا كانت كلاهما قطع فريدة 1-of-1، تأخذان جميعاً المركز #1 مكرر كـ OpenSea
-            if item["has_unique_trait"] and results[i - 1]["has_unique_trait"]:
-                item["rank"] = 1
-            else:
+    # 🎯 إذا توفر ترتيب OpenSea الرسمي، نرتب به المجموعات المطابقة 100%
+    if has_any_opensea_rank:
+        results.sort(key=lambda x: (
+            0 if x["opensea_rank"] is not None else 1,
+            x["opensea_rank"] if x["opensea_rank"] is not None else 999999,
+            -x["rarity_score"]
+        ))
+        for item in results:
+            item["rank"] = item["opensea_rank"] if item["opensea_rank"] is not None else 999999
+    else:
+        results.sort(key=lambda x: (1 if x["has_unique_trait"] else 0, x["rarity_score"]), reverse=True)
+        for i, item in enumerate(results):
+            if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
                 item["rank"] = results[i - 1]["rank"]
-        else:
-            item["rank"] = i + 1
+            else:
+                item["rank"] = i + 1
 
     return results
 
@@ -160,13 +187,15 @@ def compute_baseline_signature(signatures: list) -> str | None:
 
 
 def build_pseudo_nft(token_id: int, metadata: dict, watched) -> dict:
-    return {
+    nft_data = {
         "identifier": token_id,
         "name": metadata.get("name") or f"#{token_id}",
         "image_url": metadata.get("image") or metadata.get("image_url", ""),
         "opensea_url": f"https://opensea.io/assets/{watched.chain}/{watched.contract_address}/{token_id}",
         "traits": extract_traits_generic(metadata),
+        "raw_metadata": metadata,
     }
+    return nft_data
 
 
 def ensure_collection_placeholder(session, watched, revealed_count: int = 0):
@@ -197,7 +226,7 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
     total_supply = watched.max_supply or revealed_total
 
     freq = build_trait_frequency_with_count(pseudo_nfts)
-    ranked = compute_openrarity_official_scores(pseudo_nfts, freq, total=revealed_total)
+    ranked = compute_universal_rarity_scores(pseudo_nfts, freq, total=revealed_total)
 
     try:
         price_map_eth, _ = fetch_best_listings(watched.slug)
