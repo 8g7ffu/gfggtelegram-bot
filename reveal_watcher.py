@@ -1,5 +1,7 @@
 """
-محرك المراقبة الجارف المباشر المزود بـ On-Chain totalSupply Fallback لمنع التوقف الصامت.
+محرك المراقبة المتوازي التوسعي الحي (Dynamic totalSupply Expansion Engine).
+
+يتوسع تلقائياً مع زيادة السك في البلوكشين ويجلب القطع الجديدة فور صكها دون الحاجة لإعادة الإضافة.
 """
 
 import asyncio
@@ -38,7 +40,22 @@ def is_dynamic_url(uri: str) -> bool:
 
 
 def resolve_max_supply(watched: WatchedCollection) -> int:
-    """استعلام العدد الكلي من أوبن سي أو البلوكشين مباشرة لتفادي الخروج الصامت."""
+    """استعلام العدد الحقيقي الحالي المباشر من البلوكشين لمتابعة زيادة السك حيًا."""
+    # 1. الاستعلام المباشر اللحظي من البلوكشين (totalSupply)
+    try:
+        chain = watched.chain or "ethereum"
+        w3 = get_web3(chain)
+        checksum_addr = Web3.to_checksum_address(watched.contract_address)
+        # 0x18160ddd = totalSupply()
+        res = w3.eth.call({"to": checksum_addr, "data": bytes.fromhex("18160ddd")})
+        if res and len(res) == 32:
+            (on_chain_sp,) = eth_abi_decode(["uint256"], res)
+            if on_chain_sp and on_chain_sp > 0:
+                return int(on_chain_sp)
+    except Exception:
+        pass
+
+    # 2. الاستعلام الاحتياطي من أوبن سي
     try:
         supply = fetch_max_supply(watched.slug)
         if supply and supply > 0:
@@ -51,31 +68,20 @@ def resolve_max_supply(watched: WatchedCollection) -> int:
     except Exception:
         pass
 
-    # 🛡️ استعلام totalSupply() المباشر من البلوكشين
-    try:
-        chain = watched.chain or "ethereum"
-        w3 = get_web3(chain)
-        checksum_addr = Web3.to_checksum_address(watched.contract_address)
-        # 0x18160ddd = totalSupply()
-        res = w3.eth.call({"to": checksum_addr, "data": bytes.fromhex("18160ddd")})
-        if res and len(res) == 32:
-            (total_sp,) = eth_abi_decode(["uint256"], res)
-            if total_sp > 0:
-                return int(total_sp)
-    except Exception:
-        pass
-
-    # حد أقصى افتراضي أخير لتفادي التعليق نهائياً
-    return 10000
+    return watched.max_supply or 10000
 
 
 def ensure_tracks(session, watched: WatchedCollection) -> bool:
-    if not watched.max_supply:
-        max_supply = resolve_max_supply(watched)
-        watched.max_supply = max_supply
+    """تحديث ديناميكي متوسع يضيف القطع الجديدة فور صكها بالبلوكشين."""
+    latest_supply = resolve_max_supply(watched)
+
+    # إذا زاد السك في البلوكشين، نحدث الـ max_supply فوراً ونوسع التتبع
+    if not watched.max_supply or latest_supply > watched.max_supply:
+        old_supply = watched.max_supply or 0
+        watched.max_supply = latest_supply
         watched.failed_attempts = 0
         session.commit()
-        log.info(f"[{watched.slug}] الحد الأقصى للعرض المقرر: {max_supply}")
+        log.info(f"[{watched.slug}] ⚡ تحديث المعروض اللحظي من البلوكشين: {old_supply} 👈 {latest_supply}")
         ensure_collection_placeholder(session, watched, revealed_count=0)
 
     existing_count = session.query(RevealTrack).filter_by(watched_id=watched.id).count()
@@ -93,7 +99,8 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
     if new_tracks:
         session.bulk_save_objects(new_tracks)
         session.commit()
-        log.info(f"[{watched.slug}] ⚡ تم تجهيز {len(new_tracks)} صف تتبع بسرعة فائقة.")
+        log.info(f"[{watched.slug}] ⚡ توسيع التتبع تلقائياً وإضافة {len(new_tracks)} قطعة جديدة مصكوكة حديثاً.")
+
     return True
 
 
@@ -136,8 +143,6 @@ async def process_collection_async(watched_id: int):
         watched = session.query(WatchedCollection).filter_by(id=watched_id, active=True).first()
         if not watched:
             return
-
-        log.info(f"[{watched.slug}] 🔍 جاري فحص الكولكشن على شبكة ({watched.chain or 'ethereum'})...")
 
         ok = ensure_tracks(session, watched)
         if not ok:
@@ -199,7 +204,6 @@ async def process_collection_async(watched_id: int):
         session.commit()
 
         if not uris_to_fetch:
-            log.info(f"[{watched.slug}] ✨ لا توجد تغييرات جديدة بالفحص الحالي.")
             return
 
         log.info(f"[{watched.slug}] ⚡ جاري جلب الميتاداتا لـ {len(uris_to_fetch)} قطعة حقيقية عبر IPFS...")
@@ -266,7 +270,7 @@ async def process_collection_async(watched_id: int):
         if (changed_count > 0 or (cumulative_count > 0 and not has_rare_items)) and cumulative_revealed_items:
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
-                log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة حقيقية!")
+                log.info(f"[{watched.slug}] 🎯 [الترتيب التوسعي النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة حقيقية!")
 
     except Exception as e:
         log.error(f"[خطأ معالجة]: {e}")
@@ -285,13 +289,13 @@ async def process_collection_with_timeout(watched_id: int):
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الذكي الصارم.")
+    log.info("🚀 بدأ محرك المراقبة التوسعي اللحظي المباشر.")
 
     while True:
         try:
             session = SessionLocal()
             try:
-                watched_list = session.query(WatchedCollection).filter_by(active=True).all()
+                watched_list = session.query(WatchedCollection.id).filter_by(active=True).all()
                 if watched_list:
                     log.info(f"📡 جاري مراقبة {len(watched_list)} كولكشن حالياً...")
                     tasks = [process_collection_with_timeout(w.id) for w in watched_list[:3]]
