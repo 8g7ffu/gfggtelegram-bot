@@ -1,6 +1,5 @@
 """
-وحدة القراءة المباشرة من البلوكشين بالاتصال اللاتزمني الخالص (Pure Async JSON-RPC).
-تتضمن جميع الدوال المصدرة بما فيها get_web3.
+وحدة القراءة المباشرة من البلوكشين المعتمدة على سيرفرات احتياطية لشبكة روبن هود وإيثيريوم.
 """
 
 import asyncio
@@ -22,15 +21,9 @@ RPC_URLS = {
     "robinhood": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_ROBINHOOD_KEY}",
 }
 
-WSS_URLS = {
-    "ethereum": f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_ETH_KEY}",
-    "mainnet": f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_ETH_KEY}",
-    "robinhood": f"wss://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_ROBINHOOD_KEY}",
-}
-
 MULTICALL3_ADDRESS = Web3.to_checksum_address("0xcA11bde05977b3631167028862bE2a173976CA11")
-TOKEN_URI_SELECTOR = bytes.fromhex("c87b56dd")  # tokenURI(uint256)
-MULTICALL3_AGGREGATE3_SELECTOR = bytes.fromhex("82ad56cb")  # aggregate3((address,bool,bytes)[])
+TOKEN_URI_SELECTOR = bytes.fromhex("c87b56dd")
+MULTICALL3_AGGREGATE3_SELECTOR = bytes.fromhex("82ad56cb")
 
 IPFS_GATEWAYS = [
     "https://gateway.pinata.cloud/ipfs/",
@@ -44,14 +37,13 @@ _w3_instances = {}
 
 
 def get_web3(chain: str = "ethereum") -> Web3:
-    """ترجع موصل Web3 المخصص إما لإيثيريوم أو لروبن هود."""
     chain_key = (chain or "ethereum").lower().strip()
     if chain_key in ("mainnet", "eth"):
         chain_key = "ethereum"
 
     if chain_key not in _w3_instances:
         rpc_url = RPC_URLS.get(chain_key, RPC_URLS["ethereum"])
-        _w3_instances[chain_key] = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+        _w3_instances[chain_key] = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 8}))
     return _w3_instances[chain_key]
 
 
@@ -60,7 +52,6 @@ def build_token_uri_calldata(token_id: int) -> bytes:
 
 
 async def async_batch_get_token_uris(contract_address: str, token_ids: list[int], chain: str = "ethereum") -> dict:
-    """جلب tokenURI لاتزنائياً 100% عبر JSON-RPC بطلب مباشر دون خيوط."""
     chain_key = (chain or "ethereum").lower().strip()
     if chain_key in ("mainnet", "eth"):
         chain_key = "ethereum"
@@ -92,7 +83,7 @@ async def async_batch_get_token_uris(contract_address: str, token_ids: list[int]
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(rpc_url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            async with session.post(rpc_url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     res_json = await resp.json()
                     raw_hex = res_json.get("result", "")
@@ -124,8 +115,8 @@ def detect_global_reveal_flag(contract_address: str, chain: str = "ethereum") ->
         w3 = get_web3(chain)
         checksum_addr = Web3.to_checksum_address(contract_address)
         selectors = [
-            bytes.fromhex("66c8913d"),  # revealed()
-            bytes.fromhex("f209c13e"),  # isRevealed()
+            bytes.fromhex("66c8913d"),
+            bytes.fromhex("f209c13e"),
         ]
         for sel in selectors:
             try:
