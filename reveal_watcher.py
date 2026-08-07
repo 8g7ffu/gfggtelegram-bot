@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف المزود بـ OpenSea Bulk API لتنزيل الـ 10,000 قطعة في 5 ثوانٍ.
+محرك المراقبة الجارف المزود بجلب مباشر متوازٍ من IPFS/HTTP فقط (بدون أي اعتماد على OpenSea API كمصدر بيانات).
 """
 
 import asyncio
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from models import RevealTrack, WatchedCollection, SessionLocal, init_db
 from chain_reader import (async_batch_get_token_uris, resolve_metadata,
                           async_batch_resolve_metadata, detect_global_reveal_flag)
-from rarity_core import fetch_max_supply, fetch_drop_status, fetch_all_nfts
+from rarity_core import fetch_max_supply, fetch_drop_status
 from rarity_storage import (recompute_from_chain_data, ensure_collection_placeholder,
                              content_signature, is_placeholder_fallback,
                              compute_baseline_signature)
@@ -184,45 +184,25 @@ async def process_collection_async(watched_id: int):
         if not uris_to_fetch:
             return
 
-        # ⚡ ⚡ [المسح الجماعي الخارق]: إذا كان العدد كبيراً (> 200)، استعن بـ OpenSea API لتمشيط 200 قطعة/طلب في 5 ثوانٍ!
+        # مصدر البيانات الوحيد دائمًا: قراءة مباشرة متوازية من IPFS/HTTP.
+        # (لا يوجد أي مسار احتياطي يمر عبر OpenSea API — ذاك المسار كان
+        # يلغي كل ميزة السرعة التي نبنيها، لأنه ينتظر فهرسة OpenSea نفسها.)
         fetched_this_cycle = []
-        if len(uris_to_fetch) > 200:
-            try:
-                log.info(f"[{watched.slug}] 🚀 بدء المسح الجماعي لـ {len(uris_to_fetch)} قطعة عبر OpenSea API (200 قطعة/طلب)...")
-                start_time = time.time()
-                opensea_nfts = await asyncio.to_thread(fetch_all_nfts, watched.slug)
-                elapsed = round(time.time() - start_time, 2)
+        start_time = time.time()
+        metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
+        elapsed = round(time.time() - start_time, 2)
 
-                if opensea_nfts:
-                    for item in opensea_nfts:
-                        tid_str = item.get("identifier")
-                        if tid_str and str(tid_str).isdigit():
-                            tid = int(tid_str)
-                            if tid in tracks_by_id:
-                                track = tracks_by_id[tid]
-                                sig = content_signature(item)
-                                fetched_this_cycle.append((track, item, sig))
-                                COLLECTION_METADATA_CACHE[watched.id][tid] = item
-                    session.commit()
-                    log.info(f"[{watched.slug}] 🎯 تم تمشيط {len(fetched_this_cycle)} قطعة بالكامل عبر OpenSea في {elapsed} ثوانٍ فقط!")
-            except Exception as e:
-                log.warning(f"[{watched.slug}] تعذر المسح الجماعي عبر أوبن سي: {e}")
+        for token_id, metadata in metadata_map.items():
+            if metadata is not None:
+                track = tracks_by_id[token_id]
+                sig = content_signature(metadata)
+                fetched_this_cycle.append((track, metadata, sig))
+                COLLECTION_METADATA_CACHE[watched.id][token_id] = metadata
 
-        if not fetched_this_cycle:
-            start_time = time.time()
-            metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
-            elapsed = round(time.time() - start_time, 2)
-
-            for token_id, metadata in metadata_map.items():
-                if metadata is not None:
-                    track = tracks_by_id[token_id]
-                    sig = content_signature(metadata)
-                    fetched_this_cycle.append((track, metadata, sig))
-                    COLLECTION_METADATA_CACHE[watched.id][token_id] = metadata
-
-            session.commit()
-            if fetched_this_cycle:
-                log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة بالتوازي خلال {elapsed} ثانية!")
+        session.commit()
+        if fetched_this_cycle:
+            log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة مباشرة "
+                      f"من IPFS/HTTP بالتوازي خلال {elapsed} ثانية (بدون المرور عبر OpenSea).")
 
         if not watched.baseline_locked and fetched_this_cycle:
             signatures = [sig for _, _, sig in fetched_this_cycle]
@@ -281,7 +261,7 @@ async def process_collection_async(watched_id: int):
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف السريع (Bulk API Enabled).")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع (مصدر واحد: البلوكشين/IPFS مباشرة).")
 
     while True:
         try:
