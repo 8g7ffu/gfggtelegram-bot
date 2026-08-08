@@ -1,5 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity مع المعالجة المحمية للأنواع المعقدة.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على نقاط الانتروبيا اللوغاريتمية الصافية (Pure OpenRarity).
+خالٍ تماماً من تقسيم المجموعات والتفاهات الصناعية.
 """
 
 import hashlib
@@ -15,16 +16,15 @@ from price_utils import get_eth_usd_rate
 ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
-PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
-ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
+PLACEHOLDER_NAME_HINTS = ("unrevealed", "mystery", "hidden", "?", "unknown")
 
 
-def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
+def compute_tier(rank: int, total: int) -> str | None:
+    if rank == 1:
+        return "orange"
     if not total or total <= 0:
         total = 1000
-
-    percentile = ((index + 1) / total) * 100
-
+    percentile = (rank / total) * 100
     if percentile <= ORANGE_PERCENT:
         return "orange"
     if percentile <= PINK_PERCENT:
@@ -33,48 +33,14 @@ def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
 
 
 def extract_traits_generic(metadata: dict) -> list:
-    """استخراج الخصائص الشامل مرن ومحمي 100% ضد القوائم والأنواع المعقدة."""
-    if not isinstance(metadata, dict):
-        return []
-
-    raw_traits = (
-        metadata.get("traits") or
-        metadata.get("attributes") or
-        metadata.get("properties") or
-        (metadata.get("meta") or {}).get("attributes") or
-        {}
-    )
-
+    traits = metadata.get("traits") or metadata.get("attributes") or []
     valid_traits = []
-
-    if isinstance(raw_traits, list):
-        for t in raw_traits:
-            if isinstance(t, dict):
-                t_type = str(t.get("trait_type") or t.get("name") or t.get("key") or t.get("type") or "").strip()
-                raw_val = t.get("value") or t.get("val")
-                
-                # تحويل القوائم المعقدة إلى نصوص محمية لتفادي TypeError
-                if isinstance(raw_val, (list, tuple)):
-                    t_val = ", ".join(str(v).strip() for v in raw_val if v)
-                else:
-                    t_val = str(raw_val or "").strip()
-
-                if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
-                    valid_traits.append({"trait_type": t_type, "value": t_val})
-
-    elif isinstance(raw_traits, dict):
-        for k, v in raw_traits.items():
-            if isinstance(v, (list, tuple)):
-                v_str = ", ".join(str(x).strip() for x in v if x)
-            elif isinstance(v, dict):
-                v_str = str(v.get("value") or v.get("val") or "").strip()
-            else:
-                v_str = str(v or "").strip()
-
-            k_str = str(k).strip()
-            if k_str and v_str and not any(h in v_str.lower() for h in PLACEHOLDER_NAME_HINTS):
-                valid_traits.append({"trait_type": k_str, "value": v_str})
-
+    for t in traits:
+        if isinstance(t, dict):
+            t_type = str(t.get("trait_type", "")).strip()
+            t_val = str(t.get("value", "")).strip()
+            if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
+                valid_traits.append({"trait_type": t_type, "value": t_val})
     return valid_traits
 
 
@@ -109,6 +75,9 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
+    """
+    حساب نقاط الندرة اللوغاريتمية الصافية المباشرة (Pure OpenRarity Score) بدون أي تقسيم صناعي.
+    """
     results = []
     has_any_opensea_rank = False
 
@@ -121,10 +90,12 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
         traits = nft.get("traits") or []
         score = 0.0
 
+        # 1. نقاط عدد الخصائص (Trait Count)
         t_count_str = str(len(traits))
         count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
         score += math.log2(total / max(count_tc, 1))
 
+        # 2. نقاط الخصائص اللوغاريتمية الصافية
         for trait in traits:
             t_type = trait.get("trait_type")
             t_value = trait.get("value")
@@ -142,6 +113,7 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "opensea_rank": opensea_rank,
         })
 
+    # دمج رتبة أوبن سي إن وجدت، وإلا الترتيب المباشر النقائي حسب أعلى نقاط الندرة
     if has_any_opensea_rank:
         results.sort(key=lambda x: (
             0 if x["opensea_rank"] is not None else 1,
@@ -164,27 +136,20 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
 def content_signature(metadata: dict) -> str:
     image = metadata.get("image") or metadata.get("image_url") or ""
     traits = extract_traits_generic(metadata)
-    normalized_traits = sorted((t["trait_type"], str(t["value"])) for t in traits)
+    normalized_traits = sorted((t["trait_type"], t["value"]) for t in traits)
     raw = json.dumps({"image": image, "traits": normalized_traits}, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def is_placeholder_fallback(metadata: dict) -> bool:
-    if not isinstance(metadata, dict) or not metadata:
+    if not metadata:
         return True
-
     name = str(metadata.get("name", "")).lower()
     if any(hint in name for hint in PLACEHOLDER_NAME_HINTS):
         return True
-
-    image = str(metadata.get("image") or metadata.get("image_url") or "").lower()
-    if any(hint in image for hint in PLACEHOLDER_NAME_HINTS):
-        return True
-
     traits = extract_traits_generic(metadata)
-    if not traits and not metadata.get("image") and not metadata.get("image_url"):
+    if not traits:
         return True
-
     return False
 
 
@@ -285,8 +250,8 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
         collection.computed_at = datetime.now(timezone.utc)
         session.query(RareItem).filter_by(collection_id=collection.id).delete()
 
-    for idx, item in enumerate(ranked):
-        tier = compute_tier(item["rank"], total_supply, index=idx)
+    for item in ranked:
+        tier = compute_tier(item["rank"], total_supply)
         if tier is None:
             continue
 
@@ -311,3 +276,4 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
 
     session.commit()
     return {"ok": True, "revealed_total": revealed_total}
+
