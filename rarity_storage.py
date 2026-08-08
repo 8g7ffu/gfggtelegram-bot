@@ -1,6 +1,5 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على نقاط الانتروبيا اللوغاريتمية الصافية (Pure OpenRarity).
-خالٍ تماماً من تقسيم المجموعات والتفاهات الصناعية.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity مع الفلترة الصريحة المحمية.
 """
 
 import hashlib
@@ -16,7 +15,9 @@ from price_utils import get_eth_usd_rate
 ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
-PLACEHOLDER_NAME_HINTS = ("unrevealed", "mystery", "hidden", "?", "unknown")
+# كلمات الحظر الصريحة للصور المؤقتة فقط
+PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
+ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 
 
 def compute_tier(rank: int, total: int) -> str | None:
@@ -33,14 +34,25 @@ def compute_tier(rank: int, total: int) -> str | None:
 
 
 def extract_traits_generic(metadata: dict) -> list:
+    """استخراج الصفات الحقيقية بمرونة عالية لمنع حظر أسماء الكولكشنات."""
     traits = metadata.get("traits") or metadata.get("attributes") or []
     valid_traits = []
-    for t in traits:
-        if isinstance(t, dict):
-            t_type = str(t.get("trait_type", "")).strip()
-            t_val = str(t.get("value", "")).strip()
-            if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
-                valid_traits.append({"trait_type": t_type, "value": t_val})
+
+    if isinstance(traits, list):
+        for t in traits:
+            if isinstance(t, dict):
+                t_type = str(t.get("trait_type", "")).strip()
+                t_val = str(t.get("value", "")).strip()
+                if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
+                    valid_traits.append({"trait_type": t_type, "value": t_val})
+    elif isinstance(traits, dict):
+        for k, v in traits.items():
+            if k and v:
+                t_type = str(k).strip()
+                t_val = str(v).strip()
+                if not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
+                    valid_traits.append({"trait_type": t_type, "value": t_val})
+
     return valid_traits
 
 
@@ -75,9 +87,6 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
-    """
-    حساب نقاط الندرة اللوغاريتمية الصافية المباشرة (Pure OpenRarity Score) بدون أي تقسيم صناعي.
-    """
     results = []
     has_any_opensea_rank = False
 
@@ -90,12 +99,10 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
         traits = nft.get("traits") or []
         score = 0.0
 
-        # 1. نقاط عدد الخصائص (Trait Count)
         t_count_str = str(len(traits))
         count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
         score += math.log2(total / max(count_tc, 1))
 
-        # 2. نقاط الخصائص اللوغاريتمية الصافية
         for trait in traits:
             t_type = trait.get("trait_type")
             t_value = trait.get("value")
@@ -113,7 +120,6 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "opensea_rank": opensea_rank,
         })
 
-    # دمج رتبة أوبن سي إن وجدت، وإلا الترتيب المباشر النقائي حسب أعلى نقاط الندرة
     if has_any_opensea_rank:
         results.sort(key=lambda x: (
             0 if x["opensea_rank"] is not None else 1,
