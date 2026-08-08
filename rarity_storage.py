@@ -1,279 +1,295 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على نقاط الانتروبيا اللوغاريتمية الصافية (Pure OpenRarity).
-خالٍ تماماً من تقسيم المجموعات والتفاهات الصناعية.
+وحدة القراءة المباشرة من البلوكشين المعتمدة على سيرفرات احتياطية لشبكة روبن هود وإيثيريوم.
 """
 
-import hashlib
+import asyncio
+import base64
 import json
-import math
-from collections import Counter
-from datetime import datetime, timezone
+import logging
+import os
+import time
+import urllib.parse
+import aiohttp
+import requests
+from eth_abi import decode as eth_abi_decode, encode as eth_abi_encode
+from web3 import Web3
 
-from models import Collection, RareItem
-from rarity_core import compute_rarity_scores, fetch_best_listings, fetch_all_nfts
-from price_utils import get_eth_usd_rate
+log = logging.getLogger("chain-reader")
 
-ORANGE_PERCENT = 1.0
-PINK_PERCENT = 5.0
+ALCHEMY_ETH_KEY = os.environ.get("ALCHEMY_ETH_KEY") or os.environ.get("ALCHEMY_API_KEY", "")
+ALCHEMY_ROBINHOOD_KEY = os.environ.get("ALCHEMY_ROBINHOOD_KEY", ALCHEMY_ETH_KEY)
 
-PLACEHOLDER_NAME_HINTS = ("unrevealed", "mystery", "hidden", "?", "unknown")
+RPC_URLS = {
+    "ethereum": f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_ETH_KEY}",
+    "mainnet": f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_ETH_KEY}",
+    "robinhood": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_ROBINHOOD_KEY}",
+}
 
+MULTICALL3_ADDRESS = Web3.to_checksum_address("0xcA11bde05977b3631167028862bE2a173976CA11")
+TOKEN_URI_SELECTOR = bytes.fromhex("c87b56dd")
+MULTICALL3_AGGREGATE3_SELECTOR = bytes.fromhex("82ad56cb")
 
-def compute_tier(rank: int, total: int) -> str | None:
-    if rank == 1:
-        return "orange"
-    if not total or total <= 0:
-        total = 1000
-    percentile = (rank / total) * 100
-    if percentile <= ORANGE_PERCENT:
-        return "orange"
-    if percentile <= PINK_PERCENT:
-        return "pink"
-    return None
+PINATA_GATEWAY_DOMAIN = os.environ.get("PINATA_GATEWAY_DOMAIN", "").strip()
+PINATA_GATEWAY_KEY = os.environ.get("PINATA_GATEWAY_KEY", "").strip()
 
+# تشخيص مفصّل لسباق البوابات - تقدر تعطّله بمتغير بيئة لو صار مزعج بالإنتاج
+DIAGNOSTIC_GATEWAY_RACE = os.environ.get("DIAGNOSTIC_GATEWAY_RACE", "true").lower() == "true"
 
-def extract_traits_generic(metadata: dict) -> list:
-    traits = metadata.get("traits") or metadata.get("attributes") or []
-    valid_traits = []
-    for t in traits:
-        if isinstance(t, dict):
-            t_type = str(t.get("trait_type", "")).strip()
-            t_val = str(t.get("value", "")).strip()
-            if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
-                valid_traits.append({"trait_type": t_type, "value": t_val})
-    return valid_traits
+IPFS_GATEWAYS_NAMED = [
+    ("pinata-public", "https://gateway.pinata.cloud/ipfs/"),
+    ("ipfs.io", "https://ipfs.io/ipfs/"),
+    ("cloudflare", "https://cloudflare-ipfs.com/ipfs/"),
+]
 
 
-def extract_opensea_official_rank(metadata: dict) -> int | None:
-    try:
-        rarity_obj = metadata.get("rarity")
-        if isinstance(rarity_obj, dict):
-            rank = rarity_obj.get("rank")
-            if rank and isinstance(rank, int) and rank > 0:
-                return rank
-    except Exception:
-        pass
-    return None
-
-
-def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
-    freq = {}
-    for nft in nfts:
-        traits = nft.get("traits") or []
-        trait_count_str = str(len(traits))
-        freq.setdefault("Trait Count", {})
-        freq["Trait Count"][trait_count_str] = freq["Trait Count"].get(trait_count_str, 0) + 1
-
-        for trait in traits:
-            t_type = trait.get("trait_type")
-            t_value = trait.get("value")
-            if not t_type or not t_value:
-                continue
-            freq.setdefault(t_type, {})
-            freq[t_type][t_value] = freq[t_type].get(t_value, 0) + 1
-    return freq
-
-
-def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
-    """
-    حساب نقاط الندرة اللوغاريتمية الصافية المباشرة (Pure OpenRarity Score) بدون أي تقسيم صناعي.
-    """
-    results = []
-    has_any_opensea_rank = False
-
-    for nft in nfts:
-        metadata_raw = nft.get("raw_metadata") or nft
-        opensea_rank = extract_opensea_official_rank(metadata_raw)
-        if opensea_rank is not None:
-            has_any_opensea_rank = True
-
-        traits = nft.get("traits") or []
-        score = 0.0
-
-        # 1. نقاط عدد الخصائص (Trait Count)
-        t_count_str = str(len(traits))
-        count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
-        score += math.log2(total / max(count_tc, 1))
-
-        # 2. نقاط الخصائص اللوغاريتمية الصافية
-        for trait in traits:
-            t_type = trait.get("trait_type")
-            t_value = trait.get("value")
-            if not t_type or not t_value:
-                continue
-            count = freq.get(t_type, {}).get(t_value, 1)
-            score += math.log2(total / max(count, 1))
-
-        results.append({
-            "identifier": nft.get("identifier"),
-            "name": nft.get("name") or f"#{nft.get('identifier')}",
-            "opensea_url": nft.get("opensea_url", ""),
-            "image_url": nft.get("image_url", ""),
-            "rarity_score": round(score, 4),
-            "opensea_rank": opensea_rank,
-        })
-
-    # دمج رتبة أوبن سي إن وجدت، وإلا الترتيب المباشر النقائي حسب أعلى نقاط الندرة
-    if has_any_opensea_rank:
-        results.sort(key=lambda x: (
-            0 if x["opensea_rank"] is not None else 1,
-            x["opensea_rank"] if x["opensea_rank"] is not None else 999999,
-            -x["rarity_score"]
-        ))
-        for item in results:
-            item["rank"] = item["opensea_rank"] if item["opensea_rank"] is not None else 999999
-    else:
-        results.sort(key=lambda x: x["rarity_score"], reverse=True)
-        for i, item in enumerate(results):
-            if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
-                item["rank"] = results[i - 1]["rank"]
-            else:
-                item["rank"] = i + 1
-
-    return results
-
-
-def content_signature(metadata: dict) -> str:
-    image = metadata.get("image") or metadata.get("image_url") or ""
-    traits = extract_traits_generic(metadata)
-    normalized_traits = sorted((t["trait_type"], t["value"]) for t in traits)
-    raw = json.dumps({"image": image, "traits": normalized_traits}, sort_keys=True)
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
-def is_placeholder_fallback(metadata: dict) -> bool:
-    if not metadata:
-        return True
-    name = str(metadata.get("name", "")).lower()
-    if any(hint in name for hint in PLACEHOLDER_NAME_HINTS):
-        return True
-    traits = extract_traits_generic(metadata)
-    if not traits:
-        return True
-    return False
-
-
-def compute_baseline_signature(signatures: list) -> str | None:
-    if len(signatures) < 15:
+def _pinata_dedicated_url(path: str) -> str | None:
+    if not PINATA_GATEWAY_DOMAIN or not PINATA_GATEWAY_KEY:
         return None
-    counter = Counter(signatures)
-    most_common_sig, count = counter.most_common(1)[0]
-    if count / len(signatures) < 0.5:
-        return None
-    return most_common_sig
+    return f"https://{PINATA_GATEWAY_DOMAIN}/ipfs/{path}?pinataGatewayToken={PINATA_GATEWAY_KEY}"
 
 
-def build_pseudo_nft(token_id: int, metadata: dict, watched) -> dict:
-    return {
-        "identifier": token_id,
-        "name": metadata.get("name") or f"#{token_id}",
-        "image_url": metadata.get("image") or metadata.get("image_url", ""),
-        "opensea_url": f"https://opensea.io/assets/{watched.chain}/{watched.contract_address}/{token_id}",
-        "traits": extract_traits_generic(metadata),
-        "raw_metadata": metadata,
+_w3_instances = {}
+
+
+def get_web3(chain: str = "ethereum") -> Web3:
+    chain_key = (chain or "ethereum").lower().strip()
+    if chain_key in ("mainnet", "eth"):
+        chain_key = "ethereum"
+
+    if chain_key not in _w3_instances:
+        rpc_url = RPC_URLS.get(chain_key, RPC_URLS["ethereum"])
+        _w3_instances[chain_key] = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 8}))
+    return _w3_instances[chain_key]
+
+
+def build_token_uri_calldata(token_id: int) -> bytes:
+    return TOKEN_URI_SELECTOR + eth_abi_encode(["uint256"], [token_id])
+
+
+async def async_batch_get_token_uris(contract_address: str, token_ids: list[int], chain: str = "ethereum") -> dict:
+    chain_key = (chain or "ethereum").lower().strip()
+    if chain_key in ("mainnet", "eth"):
+        chain_key = "ethereum"
+
+    rpc_url = RPC_URLS.get(chain_key, RPC_URLS["ethereum"])
+    contract_checksum = Web3.to_checksum_address(contract_address)
+
+    calls = [
+        (contract_checksum, True, build_token_uri_calldata(token_id))
+        for token_id in token_ids
+    ]
+
+    multicall_calldata = "0x" + (
+        MULTICALL3_AGGREGATE3_SELECTOR + eth_abi_encode(["(address,bool,bytes)[]"], [calls])
+    ).hex()
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_call",
+        "params": [
+            {"to": MULTICALL3_ADDRESS, "data": multicall_calldata},
+            "latest"
+        ],
+        "id": 1
     }
 
-
-def ensure_collection_placeholder(session, watched, revealed_count: int = 0):
-    existing = session.query(Collection).filter_by(slug=watched.slug).first()
-    if existing:
-        existing.revealed_count = revealed_count
-        existing.total_items = watched.max_supply or existing.total_items
-        existing.computed_at = datetime.now(timezone.utc)
-    else:
-        session.add(Collection(
-            slug=watched.slug,
-            name=watched.slug,
-            chain=watched.chain,
-            total_items=watched.max_supply or 0,
-            revealed_count=revealed_count,
-            opensea_url=f"https://opensea.io/collection/{watched.slug}",
-            computed_at=datetime.now(timezone.utc),
-        ))
-    session.commit()
-
-
-def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
-    if not revealed_items:
-        return {"ok": False, "reason": "no_revealed_yet"}
-
-    opensea_ranks = {}
-    try:
-        opensea_nfts = fetch_all_nfts(watched.slug)
-        for onft in opensea_nfts:
-            tid = str(onft.get("identifier", ""))
-            rarity_obj = onft.get("rarity")
-            if tid and isinstance(rarity_obj, dict):
-                rk = rarity_obj.get("rank")
-                if rk and isinstance(rk, int) and rk > 0:
-                    opensea_ranks[tid] = rk
-    except Exception:
-        pass
-
-    pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
-    revealed_total = len(pseudo_nfts)
-    total_supply = watched.max_supply or revealed_total
-
-    freq = build_trait_frequency_with_count(pseudo_nfts)
-    ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, total=revealed_total)
-
-    if opensea_ranks:
-        for item in ranked:
-            tid_str = str(item["identifier"])
-            if tid_str in opensea_ranks:
-                item["rank"] = opensea_ranks[tid_str]
-        ranked.sort(key=lambda x: x["rank"])
+    output = {tid: None for tid in token_ids}
+    headers = {"Content-Type": "application/json"}
+    start = time.monotonic()
 
     try:
-        price_map_eth, _ = fetch_best_listings(watched.slug)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(rpc_url, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status == 200:
+                    res_json = await resp.json()
+                    raw_hex = res_json.get("result", "")
+                    if raw_hex and raw_hex.startswith("0x"):
+                        return_bytes = bytes.fromhex(raw_hex[2:])
+                        (results,) = eth_abi_decode(["(bool,bytes)[]"], return_bytes)
+                        for token_id, (success, return_data) in zip(token_ids, results):
+                            if success and return_data:
+                                try:
+                                    (decoded_uri,) = eth_abi_decode(["string"], return_data)
+                                    output[token_id] = decoded_uri
+                                except Exception:
+                                    pass
+    except Exception as e:
+        log.error(f"[Multicall خطأ على {chain_key}]: {e}")
+
+    if DIAGNOSTIC_GATEWAY_RACE:
+        elapsed = round(time.monotonic() - start, 3)
+        found = sum(1 for v in output.values() if v)
+        log.info(f"[تشخيص Multicall] {chain_key}: {found}/{len(token_ids)} tokenURI رجعت خلال {elapsed} ثانية.")
+
+    return output
+
+
+def batch_get_token_uris(contract_address: str, token_ids: list[int], chain: str = "ethereum") -> dict:
+    try:
+        return asyncio.run(async_batch_get_token_uris(contract_address, token_ids, chain))
     except Exception:
-        price_map_eth = {}
+        return {tid: None for tid in token_ids}
 
-    eth_usd_rate = get_eth_usd_rate()
 
-    collection = session.query(Collection).filter_by(slug=watched.slug).first()
-    if not collection:
-        collection = Collection(
-            slug=watched.slug,
-            name=watched.slug,
-            chain=watched.chain,
-            total_items=total_supply,
-            revealed_count=revealed_total,
-            opensea_url=f"https://opensea.io/collection/{watched.slug}",
-            computed_at=datetime.now(timezone.utc),
-        )
-        session.add(collection)
-        session.flush()
-    else:
-        collection.revealed_count = revealed_total
-        collection.total_items = total_supply
-        collection.computed_at = datetime.now(timezone.utc)
-        session.query(RareItem).filter_by(collection_id=collection.id).delete()
+def detect_global_reveal_flag(contract_address: str, chain: str = "ethereum") -> bool | None:
+    try:
+        w3 = get_web3(chain)
+        checksum_addr = Web3.to_checksum_address(contract_address)
+        selectors = [
+            ("revealed()/isRevealed()-A", bytes.fromhex("66c8913d")),
+            ("revealed()/isRevealed()-B", bytes.fromhex("f209c13e")),
+        ]
+        for name, sel in selectors:
+            try:
+                res = w3.eth.call({"to": checksum_addr, "data": sel})
+                if res and len(res) == 32:
+                    (is_rev,) = eth_abi_decode(["bool"], res)
+                    if DIAGNOSTIC_GATEWAY_RACE:
+                        log.info(f"[تشخيص مؤشر العقد] الدالة '{name}' موجودة فعليًا، النتيجة: {is_rev}")
+                    return bool(is_rev)
+            except Exception:
+                continue
+        return None
+    except Exception:
+        return None
 
-    for item in ranked:
-        tier = compute_tier(item["rank"], total_supply)
-        if tier is None:
-            continue
 
-        price_eth = price_map_eth.get(str(item["identifier"])) if isinstance(price_map_eth, dict) else None
-        if price_eth and price_eth > 500:
-            price_eth = None
+async def _fetch_gw_timed(session: aiohttp.ClientSession, name: str, url: str) -> tuple:
+    """يرجع (اسم_البوابة, النتيجة_أو_None, المدة_بالثانية) - للتشخيص والسباق الحقيقي."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RarityRadar/1.0"}
+    start = time.monotonic()
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)) as resp:
+            elapsed = time.monotonic() - start
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                return (name, data, elapsed)
+            return (name, None, elapsed)
+    except Exception:
+        return (name, None, time.monotonic() - start)
 
-        price_usd = (price_eth * eth_usd_rate) if (price_eth is not None and eth_usd_rate) else None
 
-        session.add(RareItem(
-            collection_id=collection.id,
-            identifier=str(item["identifier"]),
-            name=item["name"],
-            image_url=item.get("image_url", ""),
-            opensea_url=item.get("opensea_url", ""),
-            rarity_score=item["rarity_score"],
-            rank=item["rank"],
-            price_eth=price_eth,
-            price_usd=price_usd,
-            tier=tier,
-        ))
+async def _race_gateways(session: aiohttp.ClientSession, contenders: list[tuple]) -> dict | None:
+    """
+    سباق حقيقي: يرجع أول نتيجة ناجحة فورًا (بدون انتظار الباقي)، ويلغي
+    باقي الطلبات المعلّقة. يسجّل تشخيص كامل: كل بوابة، وقتها، ومن فاز.
+    contenders: قائمة (اسم, رابط)
+    """
+    tasks = {asyncio.create_task(_fetch_gw_timed(session, name, url)): name for name, url in contenders}
+    pending = set(tasks.keys())
+    log_lines = []
+    winner = None
 
-    session.commit()
-    return {"ok": True, "revealed_total": revealed_total}
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            name, data, elapsed = task.result()
+            status = "✅ نجحت" if data else "❌ فشلت/فارغة"
+            log_lines.append(f"{name}={elapsed:.3f}ث({status})")
+            if data and winner is None:
+                winner = (name, data, elapsed)
 
+        if winner:
+            for t in pending:
+                t.cancel()
+            break
+
+    if DIAGNOSTIC_GATEWAY_RACE:
+        winner_name = winner[0] if winner else "لا أحد"
+        log.info(f"[تشخيص سباق البوابات] الفائز: {winner_name} | التفاصيل: {' | '.join(log_lines)}")
+
+    return winner[1] if winner else None
+
+
+async def _async_fetch_single_metadata(session: aiohttp.ClientSession, uri: str) -> dict | None:
+    if not uri:
+        return None
+
+    try:
+        if uri.startswith("data:application/json;base64,"):
+            payload = uri.split(",", 1)[1]
+            return json.loads(base64.b64decode(payload))
+
+        if uri.startswith("data:application/json,"):
+            payload = uri.split(",", 1)[1]
+            return json.loads(urllib.parse.unquote(payload))
+
+        if uri.startswith("ipfs://"):
+            path = uri[len("ipfs://"):]
+            if path.startswith("ipfs/"):
+                path = path[5:]
+
+            contenders = [(name, base + path) for name, base in IPFS_GATEWAYS_NAMED]
+            dedicated_url = _pinata_dedicated_url(path)
+            if dedicated_url:
+                contenders = [("pinata-dedicated", dedicated_url)] + contenders
+
+            return await _race_gateways(session, contenders)
+
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RarityRadar/1.0"}
+        async with session.get(uri, headers=headers, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
+            if resp.status == 200:
+                return await resp.json(content_type=None)
+        return None
+    except Exception:
+        return None
+
+
+async def async_batch_resolve_metadata(uri_map: dict[int, str]) -> dict[int, dict | None]:
+    connector = aiohttp.TCPConnector(limit=150, ttl_dns_cache=300, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [
+            _async_fetch_single_metadata(session, uri)
+            for tid, uri in uri_map.items()
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        metadata_dict = {}
+        for (tid, uri), res in zip(uri_map.items(), results):
+            if isinstance(res, dict):
+                metadata_dict[tid] = res
+            else:
+                metadata_dict[tid] = None
+
+        return metadata_dict
+
+
+def resolve_metadata(uri: str) -> dict | None:
+    if not uri:
+        return None
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RarityRadar/1.0"}
+    try:
+        if uri.startswith("data:application/json;base64,"):
+            payload = uri.split(",", 1)[1]
+            return json.loads(base64.b64decode(payload))
+
+        if uri.startswith("data:application/json,"):
+            payload = uri.split(",", 1)[1]
+            return json.loads(urllib.parse.unquote(payload))
+
+        if uri.startswith("ipfs://"):
+            path = uri[len("ipfs://"):]
+            if path.startswith("ipfs/"):
+                path = path[5:]
+
+            gateways_to_try = [(name, base + path) for name, base in IPFS_GATEWAYS_NAMED]
+            dedicated_url = _pinata_dedicated_url(path)
+            if dedicated_url:
+                gateways_to_try = [("pinata-dedicated", dedicated_url)] + gateways_to_try
+
+            for name, url in gateways_to_try:
+                try:
+                    resp = requests.get(url, headers=headers, timeout=2.5)
+                    if resp.status_code == 200:
+                        return resp.json()
+                except Exception:
+                    continue
+            return None
+
+        resp = requests.get(uri, headers=headers, timeout=3)
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception:
+        return None
