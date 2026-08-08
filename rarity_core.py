@@ -1,5 +1,5 @@
 """
-وحدة مشتركة لجلب قطع مجموعة NFT وجلب العروض الحية المعتمدة رسمياً من OpenSea.
+وحدة مشتركة لجلب قطع مجموعة NFT وجلب العروض الحية والترتيب بدون تعليق.
 """
 
 import os
@@ -11,44 +11,45 @@ OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "")
 PAGE_LIMIT = 200
 
 
-def fetch_all_nfts(slug: str, progress_callback=None) -> list[dict]:
+def fetch_all_nfts(slug: str, max_items: int = 1000) -> list[dict]:
+    """جلب عينات الميتاداتا والترتيب الرسمي بمهلة سريعة جداً لتفادي التعليق."""
     all_nfts = []
     cursor = None
     page = 1
 
-    while True:
-        params = {"limit": PAGE_LIMIT}
-        if cursor:
-            params["next"] = cursor
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RarityRadar/1.0"}
+    if OPENSEA_API_KEY:
+        headers["x-api-key"] = OPENSEA_API_KEY
 
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RarityRadar/1.0"}
-        if OPENSEA_API_KEY:
-            headers["x-api-key"] = OPENSEA_API_KEY
+    try:
+        while True:
+            params = {"limit": PAGE_LIMIT}
+            if cursor:
+                params["next"] = cursor
 
-        resp = requests.get(
-            f"https://api.opensea.io/api/v2/collection/{slug}/nfts",
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
+            resp = requests.get(
+                f"https://api.opensea.io/api/v2/collection/{slug}/nfts",
+                headers=headers,
+                params=params,
+                timeout=5,
+            )
 
-        if resp.status_code != 200:
-            raise RuntimeError(f"فشل جلب الصفحة {page}: HTTP {resp.status_code} - {resp.text[:200]}")
+            if resp.status_code != 200:
+                break
 
-        data = resp.json()
-        nfts = data.get("nfts", [])
-        all_nfts.extend(nfts)
+            data = resp.json()
+            nfts = data.get("nfts", [])
+            all_nfts.extend(nfts)
 
-        if progress_callback:
-            progress_callback(page, len(all_nfts))
+            cursor = data.get("next")
+            page += 1
 
-        cursor = data.get("next")
-        page += 1
+            if not cursor or not nfts or len(all_nfts) >= max_items:
+                break
 
-        if not cursor or not nfts:
-            break
-
-        time.sleep(0.2)
+            time.sleep(0.1)
+    except Exception:
+        pass
 
     return all_nfts
 
@@ -97,10 +98,6 @@ def compute_rarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict
 
 
 def fetch_best_listings(slug: str) -> tuple[dict, bool]:
-    """
-    جلب قائمة العروض الحية من OpenSea API v2 الرسمي مع إرجاع مؤشر نجاح الطلب.
-    يرجع (prices_dict, success_bool)
-    """
     prices = {}
     cursor = None
 
@@ -119,7 +116,7 @@ def fetch_best_listings(slug: str) -> tuple[dict, bool]:
                 f"https://api.opensea.io/api/v2/listings/collection/{slug}/best",
                 headers=headers,
                 params=params,
-                timeout=10,
+                timeout=8,
             )
 
             if resp.status_code != 200:
@@ -161,7 +158,7 @@ def fetch_contract_address(slug: str) -> tuple:
         resp = requests.get(
             f"https://api.opensea.io/api/v2/collections/{slug}",
             headers=headers,
-            timeout=10,
+            timeout=8,
         )
         if resp.status_code != 200:
             return None, None
@@ -194,7 +191,7 @@ def fetch_drop_status(slug: str) -> dict | None:
         resp = requests.get(
             f"https://api.opensea.io/api/v2/drops/{slug}",
             headers=headers,
-            timeout=10,
+            timeout=8,
         )
         if resp.status_code != 200:
             return None
@@ -212,7 +209,7 @@ def fetch_max_supply(slug: str) -> int | None:
         resp = requests.get(
             f"https://api.opensea.io/api/v2/collections/{slug}",
             headers=headers,
-            timeout=10,
+            timeout=8,
         )
         if resp.status_code != 200:
             return None
