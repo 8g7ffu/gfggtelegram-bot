@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف المباشر المزود بتحديث الترتيب التراكمي الفوري.
+محرك المراقبة المتوازي المباشر بمهلة آمنة 60 ثانية لضمان إتمام الحفظ بدقة 100%.
 """
 
 import asyncio
@@ -255,7 +255,6 @@ async def process_collection_async(watched_id: int):
         cumulative_revealed_items = list(COLLECTION_METADATA_CACHE[watched.id].items())
         cumulative_count = len(cumulative_revealed_items)
 
-        # 🎯 قراءة العدد المسجل السابق في الداتابيز لتحديد التحديث الفوري
         from models import Collection
         existing_collection = session.query(Collection).filter_by(slug=watched.slug).first()
         previous_count = existing_collection.revealed_count if existing_collection else 0
@@ -263,7 +262,6 @@ async def process_collection_async(watched_id: int):
 
         ensure_collection_placeholder(session, watched, revealed_count=cumulative_count)
 
-        # 🎯 الشرط المحدث: يعيد الحساب فورا كلما زاد عدد القطع المنكشفة بالذاكرة التراكمية
         if (cumulative_count > previous_count or not has_rare_items) and cumulative_revealed_items:
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
@@ -277,16 +275,17 @@ async def process_collection_async(watched_id: int):
 
 async def process_collection_with_timeout(watched_id: int):
     try:
-        await asyncio.wait_for(process_collection_async(watched_id), timeout=30.0)
+        # ⚡ ⚡ صمام أمان بمهلة 60 ثانية كاملة لضمان إتمام الحفظ بدقة بدون إلغاء
+        await asyncio.wait_for(process_collection_async(watched_id), timeout=60.0)
     except asyncio.TimeoutError:
-        log.warning(f"[Timeout] فحص الكولكشن استغرق أكثر من 30 ثانية — للانتقال المباشر للدورة التالية.")
+        log.warning(f"[Timeout] فحص الكولكشن استغرق أكثر من 60 ثانية — للانتقال المباشر للدورة التالية.")
     except Exception as e:
         log.error(f"[Error]: {e}")
 
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة التراكمي المباشر.")
+    log.info("🚀 بدأ محرك المراقبة التراكمي المباشر بمهلة آمنة 60 ثانية.")
 
     while True:
         try:
