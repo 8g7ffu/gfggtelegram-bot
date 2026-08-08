@@ -1,5 +1,5 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على استخراج الخصائص بمرونة 100% لكل هياكل JSON.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity مع المعالجة المحمية للأنواع المعقدة.
 """
 
 import hashlib
@@ -19,12 +19,12 @@ PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
 ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 
 
-def compute_tier(rank: int, total: int) -> str | None:
-    if rank == 1:
-        return "orange"
+def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
     if not total or total <= 0:
         total = 1000
-    percentile = (rank / total) * 100
+
+    percentile = ((index + 1) / total) * 100
+
     if percentile <= ORANGE_PERCENT:
         return "orange"
     if percentile <= PINK_PERCENT:
@@ -33,7 +33,7 @@ def compute_tier(rank: int, total: int) -> str | None:
 
 
 def extract_traits_generic(metadata: dict) -> list:
-    """استخراج الخصائص الفائقة المرونة لجميع هياكل ومسميات الـ JSON الممكنة."""
+    """استخراج الخصائص الشامل مرن ومحمي 100% ضد القوائم والأنواع المعقدة."""
     if not isinstance(metadata, dict):
         return []
 
@@ -41,27 +41,36 @@ def extract_traits_generic(metadata: dict) -> list:
         metadata.get("traits") or
         metadata.get("attributes") or
         metadata.get("properties") or
+        (metadata.get("meta") or {}).get("attributes") or
         {}
     )
 
     valid_traits = []
 
-    # 1. لو كانت الخصائص قائمة من القواميس
     if isinstance(raw_traits, list):
         for t in raw_traits:
             if isinstance(t, dict):
-                t_type = str(t.get("trait_type") or t.get("name") or t.get("key") or "").strip()
-                t_val = str(t.get("value") or t.get("val") or "").strip()
+                t_type = str(t.get("trait_type") or t.get("name") or t.get("key") or t.get("type") or "").strip()
+                raw_val = t.get("value") or t.get("val")
+                
+                # تحويل القوائم المعقدة إلى نصوص محمية لتفادي TypeError
+                if isinstance(raw_val, (list, tuple)):
+                    t_val = ", ".join(str(v).strip() for v in raw_val if v)
+                else:
+                    t_val = str(raw_val or "").strip()
+
                 if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
                     valid_traits.append({"trait_type": t_type, "value": t_val})
 
-    # 2. لو كانت الخصائص مفاتيح وقيم مباشرة { "Background": "Blue" }
     elif isinstance(raw_traits, dict):
         for k, v in raw_traits.items():
-            if isinstance(v, dict):
+            if isinstance(v, (list, tuple)):
+                v_str = ", ".join(str(x).strip() for x in v if x)
+            elif isinstance(v, dict):
                 v_str = str(v.get("value") or v.get("val") or "").strip()
             else:
-                v_str = str(v).strip()
+                v_str = str(v or "").strip()
+
             k_str = str(k).strip()
             if k_str and v_str and not any(h in v_str.lower() for h in PLACEHOLDER_NAME_HINTS):
                 valid_traits.append({"trait_type": k_str, "value": v_str})
@@ -155,13 +164,12 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
 def content_signature(metadata: dict) -> str:
     image = metadata.get("image") or metadata.get("image_url") or ""
     traits = extract_traits_generic(metadata)
-    normalized_traits = sorted((t["trait_type"], t["value"]) for t in traits)
+    normalized_traits = sorted((t["trait_type"], str(t["value"])) for t in traits)
     raw = json.dumps({"image": image, "traits": normalized_traits}, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def is_placeholder_fallback(metadata: dict) -> bool:
-    """مرونة فائقة: طالما تحتوي الميتاداتا على اسم أو صورة أو خصائص فهي صالحة وليست مؤقتة."""
     if not isinstance(metadata, dict) or not metadata:
         return True
 
@@ -277,8 +285,8 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
         collection.computed_at = datetime.now(timezone.utc)
         session.query(RareItem).filter_by(collection_id=collection.id).delete()
 
-    for item in ranked:
-        tier = compute_tier(item["rank"], total_supply)
+    for idx, item in enumerate(ranked):
+        tier = compute_tier(item["rank"], total_supply, index=idx)
         if tier is None:
             continue
 
