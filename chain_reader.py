@@ -25,6 +25,12 @@ MULTICALL3_ADDRESS = Web3.to_checksum_address("0xcA11bde05977b3631167028862bE2a1
 TOKEN_URI_SELECTOR = bytes.fromhex("c87b56dd")
 MULTICALL3_AGGREGATE3_SELECTOR = bytes.fromhex("82ad56cb")
 
+# بوابة Pinata الخاصة (Dedicated Gateway) - أضيفت كخيار إضافي بالسباق فقط،
+# لا تُستبدل أو تُزال أي بوابة عامة موجودة. لو المتغيرات غير موجودة، ببساطة
+# ما تُستخدم (سلوك آمن تمامًا، صفر أثر على الكود الحالي).
+PINATA_GATEWAY_DOMAIN = os.environ.get("PINATA_GATEWAY_DOMAIN", "").strip()
+PINATA_GATEWAY_KEY = os.environ.get("PINATA_GATEWAY_KEY", "").strip()
+
 IPFS_GATEWAYS = [
     "https://gateway.pinata.cloud/ipfs/",
     "https://ipfs.io/ipfs/",
@@ -32,6 +38,15 @@ IPFS_GATEWAYS = [
     "https://ipfs.filebase.io/ipfs/",
     "https://dweb.link/ipfs/",
 ]
+
+
+def _pinata_dedicated_url(path: str) -> str | None:
+    """يبني رابط بوابة Pinata الخاصة لو المتغيرات متوفرة، وإلا يرجع None
+    (يعني ببساطة ما تدخل السباق، بدون أي خطأ)."""
+    if not PINATA_GATEWAY_DOMAIN or not PINATA_GATEWAY_KEY:
+        return None
+    return f"https://{PINATA_GATEWAY_DOMAIN}/ipfs/{path}?pinataGatewayToken={PINATA_GATEWAY_KEY}"
+
 
 _w3_instances = {}
 
@@ -161,6 +176,12 @@ async def _async_fetch_single_metadata(session: aiohttp.ClientSession, uri: str)
                 path = path[5:]
 
             urls = [gw + path for gw in IPFS_GATEWAYS[:3]]
+            # بوابة Pinata الخاصة تدخل السباق أول (أسرع عادة)، بدون ما تلغي
+            # أي بوابة عامة موجودة - لو ما توفرت المتغيرات، ببساطة ما تُضاف
+            dedicated_url = _pinata_dedicated_url(path)
+            if dedicated_url:
+                urls = [dedicated_url] + urls
+
             tasks = [_fetch_gw(session, u) for u in urls]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -216,9 +237,15 @@ def resolve_metadata(uri: str) -> dict | None:
             if path.startswith("ipfs/"):
                 path = path[5:]
 
-            for gateway in IPFS_GATEWAYS:
+            gateways_to_try = list(IPFS_GATEWAYS)
+            dedicated_url = _pinata_dedicated_url(path)
+            if dedicated_url:
+                gateways_to_try = [None] + gateways_to_try  # None = علامة على استخدام dedicated_url مباشرة
+
+            for gateway in gateways_to_try:
                 try:
-                    resp = requests.get(gateway + path, headers=headers, timeout=2.5)
+                    url = dedicated_url if gateway is None else (gateway + path)
+                    resp = requests.get(url, headers=headers, timeout=2.5)
                     if resp.status_code == 200:
                         return resp.json()
                 except Exception:
@@ -231,3 +258,4 @@ def resolve_metadata(uri: str) -> dict | None:
         return None
     except Exception:
         return None
+
