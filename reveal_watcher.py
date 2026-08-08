@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف المزود بجلب مباشر متوازٍ من IPFS/HTTP فقط (بدون أي اعتماد على OpenSea API كمصدر بيانات).
+محرك المراقبة الجارف المزود بجلب مباشر متوازٍ من IPFS/HTTP ومحرك استعلام السقف الأقصى من البلوكشين.
 """
 
 import asyncio
@@ -8,9 +8,12 @@ import logging
 import time
 from datetime import datetime, timezone
 
+from eth_abi import decode as eth_abi_decode
+from web3 import Web3
+
 from models import RevealTrack, WatchedCollection, SessionLocal, init_db
 from chain_reader import (async_batch_get_token_uris, resolve_metadata,
-                          async_batch_resolve_metadata, detect_global_reveal_flag)
+                          async_batch_resolve_metadata, detect_global_reveal_flag, get_web3)
 from rarity_core import fetch_max_supply, fetch_drop_status
 from rarity_storage import (recompute_from_chain_data, ensure_collection_placeholder,
                              content_signature, is_placeholder_fallback,
@@ -34,33 +37,67 @@ def is_dynamic_url(uri: str) -> bool:
     return uri.startswith("http://") or uri.startswith("https://")
 
 
-def resolve_max_supply(watched: WatchedCollection) -> int | None:
-    supply = fetch_max_supply(watched.slug)
-    if supply:
-        return supply
-    drop_status = fetch_drop_status(watched.slug)
-    if drop_status:
-        for key in ("max_supply", "total_supply"):
-            if drop_status.get(key):
-                return int(drop_status[key])
-    return None
+def resolve_max_supply(watched: WatchedCollection) -> int:
+    """
+    استعلام السقف الأقصى الحقيقي للمجموعة مباشرة من عقد البلوكشين الذكي أولاً،
+    ثم الاستعلام من OpenSea API كاحتياطي ثانٍ.
+    """
+    chain = watched.chain or "ethereum"
+
+    # 1. فحص دوال السقف الأقصى المعيارية على البلوكشين مباشرة (On-Chain Call)
+    # selectors: maxSupply() = 0xd5abeb01, MAX_SUPPLY() = 0xd368b122, maxTokens() = 0x3a4b66f1, totalSupply() = 0x18160ddd
+    selectors = [
+        bytes.fromhex("d5abeb01"),  # maxSupply()
+        bytes.fromhex("d368b122"),  # MAX_SUPPLY()
+        bytes.fromhex("3a4b66f1"),  # maxTokens()
+        bytes.fromhex("18160ddd"),  # totalSupply()
+    ]
+
+    try:
+        w3 = get_web3(chain)
+        checksum_addr = Web3.to_checksum_address(watched.contract_address)
+
+        for sel in selectors:
+            try:
+                res = w3.eth.call({"to": checksum_addr, "data": sel})
+                if res and len(res) == 32:
+                    (on_chain_sp,) = eth_abi_decode(["uint256"], res)
+                    if on_chain_sp and on_chain_sp > 0:
+                        return int(on_chain_sp)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 2. الاستعلام الاحتياطي من OpenSea API
+    try:
+        supply = fetch_max_supply(watched.slug)
+        if supply and supply > 0:
+            return supply
+        drop_status = fetch_drop_status(watched.slug)
+        if drop_status:
+            for key in ("max_supply", "total_supply"):
+                if drop_status.get(key) and int(drop_status[key]) > 0:
+                    return int(drop_status[key])
+    except Exception:
+        pass
+
+    return watched.max_supply or 10000
 
 
 def ensure_tracks(session, watched: WatchedCollection) -> bool:
-    if not watched.max_supply:
-        max_supply = resolve_max_supply(watched)
-        if not max_supply:
-            watched.failed_attempts += 1
-            session.commit()
-            if watched.failed_attempts <= 3 or watched.failed_attempts % 10 == 0:
-                log.warning(f"[{watched.slug}] تعذر تحديد max_supply "
-                            f"(محاولة {watched.failed_attempts}) - سيتم إعادة المحاولة...")
-            return False
+    """تتبع وتوسيع ديناميكي لصفوف المينت فور زيادة السك بالبلوكشين."""
+    latest_supply = resolve_max_supply(watched)
 
-        watched.max_supply = max_supply
+    if not watched.max_supply or latest_supply > watched.max_supply:
+        old_supply = watched.max_supply or 0
+        watched.max_supply = latest_supply
         watched.failed_attempts = 0
         session.commit()
-        log.info(f"[{watched.slug}] الحد الأقصى للعرض: {max_supply}")
+        if old_supply > 0:
+            log.info(f"[{watched.slug}] ⚡ تحديث السقف الأقصى من البلوكشين: {old_supply} 👈 {latest_supply}")
+        else:
+            log.info(f"[{watched.slug}] ⚡ السقف الأقصى المحدد من البلوكشين: {latest_supply}")
         ensure_collection_placeholder(session, watched, revealed_count=0)
 
     existing_count = session.query(RevealTrack).filter_by(watched_id=watched.id).count()
@@ -78,7 +115,8 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
     if new_tracks:
         session.bulk_save_objects(new_tracks)
         session.commit()
-        log.info(f"[{watched.slug}] ⚡ تم تجهيز {len(new_tracks)} صف تتبع بسرعة فائقة.")
+        log.info(f"[{watched.slug}] ⚡ تم إدخال وتوسيع {len(new_tracks)} صف تتبع جديد للقطع المصكوكة.")
+
     return True
 
 
@@ -185,8 +223,6 @@ async def process_collection_async(watched_id: int):
             return
 
         # مصدر البيانات الوحيد دائمًا: قراءة مباشرة متوازية من IPFS/HTTP.
-        # (لا يوجد أي مسار احتياطي يمر عبر OpenSea API — ذاك المسار كان
-        # يلغي كل ميزة السرعة التي نبنيها، لأنه ينتظر فهرسة OpenSea نفسها.)
         fetched_this_cycle = []
         start_time = time.time()
         metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
@@ -197,9 +233,9 @@ async def process_collection_async(watched_id: int):
                 track = tracks_by_id[token_id]
                 sig = content_signature(metadata)
                 fetched_this_cycle.append((track, metadata, sig))
-                COLLECTION_METADATA_CACHE[watched.id][token_id] = metadata
 
         session.commit()
+
         if fetched_this_cycle:
             log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة مباشرة "
                       f"من IPFS/HTTP بالتوازي خلال {elapsed} ثانية (بدون المرور عبر OpenSea).")
@@ -261,7 +297,7 @@ async def process_collection_async(watched_id: int):
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف السريع (مصدر واحد: البلوكشين/IPFS مباشرة).")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع الذكي (مصدر واحد: البلوكشين/IPFS مباشرة + On-Chain MaxSupply).")
 
     while True:
         try:
