@@ -1,5 +1,5 @@
 """
-محرك المراقبة المتوازي المباشر بمهلة آمنة 60 ثانية لضمان إتمام الحفظ بدقة 100%.
+محرك المراقبة الجارف المزود بجلب مباشر متوازٍ من IPFS/HTTP ومحرك استعلام السقف الأقصى من البلوكشين.
 """
 
 import asyncio
@@ -38,6 +38,38 @@ def is_dynamic_url(uri: str) -> bool:
 
 
 def resolve_max_supply(watched: WatchedCollection) -> int:
+    """
+    استعلام السقف الأقصى الحقيقي للمجموعة مباشرة من عقد البلوكشين الذكي أولاً،
+    ثم الاستعلام من OpenSea API كاحتياطي ثانٍ.
+    """
+    chain = watched.chain or "ethereum"
+
+    # 1. فحص دوال السقف الأقصى المعيارية على البلوكشين مباشرة (On-Chain Call)
+    # selectors: maxSupply() = 0xd5abeb01, MAX_SUPPLY() = 0xd368b122, maxTokens() = 0x3a4b66f1, totalSupply() = 0x18160ddd
+    selectors = [
+        bytes.fromhex("d5abeb01"),  # maxSupply()
+        bytes.fromhex("d368b122"),  # MAX_SUPPLY()
+        bytes.fromhex("3a4b66f1"),  # maxTokens()
+        bytes.fromhex("18160ddd"),  # totalSupply()
+    ]
+
+    try:
+        w3 = get_web3(chain)
+        checksum_addr = Web3.to_checksum_address(watched.contract_address)
+
+        for sel in selectors:
+            try:
+                res = w3.eth.call({"to": checksum_addr, "data": sel})
+                if res and len(res) == 32:
+                    (on_chain_sp,) = eth_abi_decode(["uint256"], res)
+                    if on_chain_sp and on_chain_sp > 0:
+                        return int(on_chain_sp)
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 2. الاستعلام الاحتياطي من OpenSea API
     try:
         supply = fetch_max_supply(watched.slug)
         if supply and supply > 0:
@@ -50,22 +82,11 @@ def resolve_max_supply(watched: WatchedCollection) -> int:
     except Exception:
         pass
 
-    try:
-        chain = watched.chain or "ethereum"
-        w3 = get_web3(chain)
-        checksum_addr = Web3.to_checksum_address(watched.contract_address)
-        res = w3.eth.call({"to": checksum_addr, "data": bytes.fromhex("18160ddd")})
-        if res and len(res) == 32:
-            (total_sp,) = eth_abi_decode(["uint256"], res)
-            if total_sp > 0:
-                return int(total_sp)
-    except Exception:
-        pass
-
     return watched.max_supply or 10000
 
 
 def ensure_tracks(session, watched: WatchedCollection) -> bool:
+    """تتبع وتوسيع ديناميكي لصفوف المينت فور زيادة السك بالبلوكشين."""
     latest_supply = resolve_max_supply(watched)
 
     if not watched.max_supply or latest_supply > watched.max_supply:
@@ -201,11 +222,12 @@ async def process_collection_async(watched_id: int):
         if not uris_to_fetch:
             return
 
+        # مصدر البيانات الوحيد دائمًا: قراءة مباشرة متوازية من IPFS/HTTP.
+        fetched_this_cycle = []
         start_time = time.time()
         metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
         elapsed = round(time.time() - start_time, 2)
 
-        fetched_this_cycle = []
         for token_id, metadata in metadata_map.items():
             if metadata is not None:
                 track = tracks_by_id[token_id]
@@ -215,7 +237,8 @@ async def process_collection_async(watched_id: int):
         session.commit()
 
         if fetched_this_cycle:
-            log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة خلال {elapsed} ثانية!")
+            log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة مباشرة "
+                      f"من IPFS/HTTP بالتوازي خلال {elapsed} ثانية (بدون المرور عبر OpenSea).")
 
         if not watched.baseline_locked and fetched_this_cycle:
             signatures = [sig for _, _, sig in fetched_this_cycle]
@@ -255,17 +278,16 @@ async def process_collection_async(watched_id: int):
         cumulative_revealed_items = list(COLLECTION_METADATA_CACHE[watched.id].items())
         cumulative_count = len(cumulative_revealed_items)
 
-        from models import Collection
-        existing_collection = session.query(Collection).filter_by(slug=watched.slug).first()
-        previous_count = existing_collection.revealed_count if existing_collection else 0
-        has_rare_items = existing_collection and len(existing_collection.rare_items) > 0
-
         ensure_collection_placeholder(session, watched, revealed_count=cumulative_count)
 
-        if (cumulative_count > previous_count or not has_rare_items) and cumulative_revealed_items:
+        from models import Collection
+        existing_collection = session.query(Collection).filter_by(slug=watched.slug).first()
+        has_rare_items = existing_collection and len(existing_collection.rare_items) > 0
+
+        if (changed_count > 0 or (cumulative_count > 0 and not has_rare_items)) and cumulative_revealed_items:
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
-                log.info(f"[{watched.slug}] 🎯 [الترتيب الفوري المحدث] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة على شبكة ({chain}) بالكامل!")
+                log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة على شبكة ({chain}) بالكامل!")
 
     except Exception as e:
         log.error(f"[خطأ معالجة]: {e}")
@@ -273,19 +295,9 @@ async def process_collection_async(watched_id: int):
         session.close()
 
 
-async def process_collection_with_timeout(watched_id: int):
-    try:
-        # ⚡ ⚡ صمام أمان بمهلة 60 ثانية كاملة لضمان إتمام الحفظ بدقة بدون إلغاء
-        await asyncio.wait_for(process_collection_async(watched_id), timeout=60.0)
-    except asyncio.TimeoutError:
-        log.warning(f"[Timeout] فحص الكولكشن استغرق أكثر من 60 ثانية — للانتقال المباشر للدورة التالية.")
-    except Exception as e:
-        log.error(f"[Error]: {e}")
-
-
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة التراكمي المباشر بمهلة آمنة 60 ثانية.")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع الذكي (مصدر واحد: البلوكشين/IPFS مباشرة + On-Chain MaxSupply).")
 
     while True:
         try:
@@ -293,7 +305,7 @@ async def main_async_loop():
             try:
                 watched_list = session.query(WatchedCollection.id).filter_by(active=True).all()
                 if watched_list:
-                    tasks = [process_collection_with_timeout(w.id) for w in watched_list[:3]]
+                    tasks = [process_collection_async(w.id) for w in watched_list[:3]]
                     await asyncio.gather(*tasks, return_exceptions=True)
                 else:
                     log.info("لا توجد مجموعات تحت المراقبة حاليًا.")
@@ -309,3 +321,4 @@ async def main_async_loop():
 
 if __name__ == "__main__":
     asyncio.run(main_async_loop())
+
