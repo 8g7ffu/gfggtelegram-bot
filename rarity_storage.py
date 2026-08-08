@@ -1,5 +1,5 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity مع الفلترة الصريحة المحمية.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على استخراج الخصائص بمرونة 100% لكل هياكل JSON.
 """
 
 import hashlib
@@ -15,7 +15,6 @@ from price_utils import get_eth_usd_rate
 ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
-# كلمات الحظر الصريحة للصور المؤقتة فقط
 PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
 ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 
@@ -34,24 +33,38 @@ def compute_tier(rank: int, total: int) -> str | None:
 
 
 def extract_traits_generic(metadata: dict) -> list:
-    """استخراج الصفات الحقيقية بمرونة عالية لمنع حظر أسماء الكولكشنات."""
-    traits = metadata.get("traits") or metadata.get("attributes") or []
+    """استخراج الخصائص الفائقة المرونة لجميع هياكل ومسميات الـ JSON الممكنة."""
+    if not isinstance(metadata, dict):
+        return []
+
+    raw_traits = (
+        metadata.get("traits") or
+        metadata.get("attributes") or
+        metadata.get("properties") or
+        {}
+    )
+
     valid_traits = []
 
-    if isinstance(traits, list):
-        for t in traits:
+    # 1. لو كانت الخصائص قائمة من القواميس
+    if isinstance(raw_traits, list):
+        for t in raw_traits:
             if isinstance(t, dict):
-                t_type = str(t.get("trait_type", "")).strip()
-                t_val = str(t.get("value", "")).strip()
+                t_type = str(t.get("trait_type") or t.get("name") or t.get("key") or "").strip()
+                t_val = str(t.get("value") or t.get("val") or "").strip()
                 if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
                     valid_traits.append({"trait_type": t_type, "value": t_val})
-    elif isinstance(traits, dict):
-        for k, v in traits.items():
-            if k and v:
-                t_type = str(k).strip()
-                t_val = str(v).strip()
-                if not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
-                    valid_traits.append({"trait_type": t_type, "value": t_val})
+
+    # 2. لو كانت الخصائص مفاتيح وقيم مباشرة { "Background": "Blue" }
+    elif isinstance(raw_traits, dict):
+        for k, v in raw_traits.items():
+            if isinstance(v, dict):
+                v_str = str(v.get("value") or v.get("val") or "").strip()
+            else:
+                v_str = str(v).strip()
+            k_str = str(k).strip()
+            if k_str and v_str and not any(h in v_str.lower() for h in PLACEHOLDER_NAME_HINTS):
+                valid_traits.append({"trait_type": k_str, "value": v_str})
 
     return valid_traits
 
@@ -148,14 +161,22 @@ def content_signature(metadata: dict) -> str:
 
 
 def is_placeholder_fallback(metadata: dict) -> bool:
-    if not metadata:
+    """مرونة فائقة: طالما تحتوي الميتاداتا على اسم أو صورة أو خصائص فهي صالحة وليست مؤقتة."""
+    if not isinstance(metadata, dict) or not metadata:
         return True
+
     name = str(metadata.get("name", "")).lower()
     if any(hint in name for hint in PLACEHOLDER_NAME_HINTS):
         return True
-    traits = extract_traits_generic(metadata)
-    if not traits:
+
+    image = str(metadata.get("image") or metadata.get("image_url") or "").lower()
+    if any(hint in image for hint in PLACEHOLDER_NAME_HINTS):
         return True
+
+    traits = extract_traits_generic(metadata)
+    if not traits and not metadata.get("image") and not metadata.get("image_url"):
+        return True
+
     return False
 
 
