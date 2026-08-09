@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف السريع واللاتزمني الخالي من التأخير أو حظر الشبكة.
+محرك المراقبة الجارف - مصدر واحد فقط: البلوكشين/IPFS مباشرة، مع تشخيص كامل.
 """
 
 import asyncio
@@ -130,6 +130,11 @@ async def process_collection_async(watched_id: int):
         chain = watched.chain or "ethereum"
         check_global_flag(session, watched)
 
+        if watched.global_revealed_flag is False:
+            ensure_collection_placeholder(session, watched, revealed_count=0)
+            log.info(f"[{watched.slug}] ⛔ [تشخيص] العقد يؤكد لسا ما انكشفت - تخطينا هذي الدورة.")
+            return
+
         if watched.id not in COLLECTION_METADATA_CACHE:
             COLLECTION_METADATA_CACHE[watched.id] = {}
 
@@ -147,10 +152,16 @@ async def process_collection_async(watched_id: int):
         if not sample_ids:
             sample_ids = token_ids[:5]
 
+        t0 = time.monotonic()
         sample_uris = await async_batch_get_token_uris(watched.contract_address, sample_ids, chain)
+        log.info(f"[{watched.slug}] [تشخيص توقيت] جلب عيّنة الأنماط ({len(sample_ids)} قطعة): "
+                  f"{round(time.monotonic() - t0, 3)} ثانية.")
 
         detected_pattern = detect_base_uri_pattern_smart(sample_uris)
+        if detected_pattern:
+            log.info(f"[{watched.slug}] [تشخيص نمط] اكتُشف نمط متسلسل: {detected_pattern[:80]}")
 
+        t0 = time.monotonic()
         if detected_pattern:
             for tid in token_ids:
                 track = tracks_by_id[tid]
@@ -177,25 +188,30 @@ async def process_collection_async(watched_id: int):
                         uris_to_fetch[token_id] = uri
 
         session.commit()
+        log.info(f"[{watched.slug}] [تشخيص توقيت] جلب كل روابط tokenURI: "
+                  f"{round(time.monotonic() - t0, 3)} ثانية ({len(uris_to_fetch)} تحتاج فحص محتوى).")
 
         if not uris_to_fetch:
+            log.info(f"[{watched.slug}] [تشخيص] لا يوجد أي رابط جديد يحتاج فحص هذي الدورة.")
             return
 
-        start_time = time.time()
-        metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
-        elapsed = round(time.time() - start_time, 2)
-
+        t0 = time.monotonic()
         fetched_this_cycle = []
+        metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
+        elapsed = round(time.monotonic() - t0, 3)
+
+        success_count = sum(1 for v in metadata_map.values() if v is not None)
+        log.info(f"[{watched.slug}] [تشخيص توقيت] جلب المحتوى الفعلي (IPFS/HTTP): "
+                  f"{elapsed} ثانية | نجح {success_count}/{len(uris_to_fetch)}.")
+
         for token_id, metadata in metadata_map.items():
             if metadata is not None:
                 track = tracks_by_id[token_id]
                 sig = content_signature(metadata)
                 fetched_this_cycle.append((track, metadata, sig))
+                COLLECTION_METADATA_CACHE[watched.id][token_id] = metadata
 
         session.commit()
-
-        if fetched_this_cycle:
-            log.info(f"[{watched.slug}] 🚀 تم جلب ميتاداتا {len(fetched_this_cycle)} قطعة خلال {elapsed} ثانية!")
 
         if not watched.baseline_locked and fetched_this_cycle:
             signatures = [sig for _, _, sig in fetched_this_cycle]
@@ -204,14 +220,17 @@ async def process_collection_async(watched_id: int):
                 watched.baseline_signature = baseline
                 watched.baseline_locked = True
                 session.commit()
-                log.info(f"[{watched.slug}] 🔒 حُدّد الشكل الموحّد (baseline) من {len(signatures)} عيّنة.")
+                log.info(f"[{watched.slug}] 🔒 [تشخيص كشف] حُدّد الشكل الموحّد (baseline) من {len(signatures)} عيّنة.")
             elif len(signatures) >= 15:
                 watched.baseline_locked = True
                 watched.baseline_signature = None
                 session.commit()
-                log.info(f"[{watched.slug}] 🔓 المجموعة منكشفة بالكامل (جميع القطع فريدة).")
+                log.info(f"[{watched.slug}] 🔓 [تشخيص كشف] المجموعة منكشفة بالكامل (كل القطع فريدة، ولا baseline).")
 
         changed_count = 0
+        conflict_count = 0
+        diag_samples = []
+
         for track, metadata, sig in fetched_this_cycle:
             was_revealed = track.revealed
             is_placeholder = is_placeholder_fallback(metadata)
@@ -219,12 +238,28 @@ async def process_collection_async(watched_id: int):
             if watched.baseline_locked and watched.baseline_signature:
                 differs_from_baseline = sig != watched.baseline_signature
                 now_revealed = differs_from_baseline and not is_placeholder
+                method = "baseline+fallback"
+                # تعارض: البصمة تقول "مختلفة عن الموحّد" (يعني منكشفة)
+                # لكن is_placeholder يرفضها - هذا يعني احتمال فقدان قطعة
+                # منكشفة فعليًا بسبب heuristic الاحتياطي
+                if differs_from_baseline and is_placeholder:
+                    conflict_count += 1
+                    if conflict_count <= 5:
+                        log.warning(
+                            f"[{watched.slug}] ⚠️ [تعارض كشف] القطعة #{track.token_id}: "
+                            f"البصمة تختلف عن baseline (يفترض منكشفة) لكن "
+                            f"is_placeholder_fallback رفضها. الاسم: '{metadata.get('name','')}' | "
+                            f"عدد الصفات: {len(metadata.get('traits') or metadata.get('attributes') or [])}"
+                        )
             else:
                 now_revealed = not is_placeholder
+                method = "fallback-only (لسا ما تحدد baseline)"
 
             track.revealed = now_revealed
             if now_revealed and not was_revealed:
                 changed_count += 1
+                if len(diag_samples) < 5:
+                    diag_samples.append(f"#{track.token_id}({method})")
 
             if now_revealed:
                 COLLECTION_METADATA_CACHE[watched.id][track.token_id] = metadata
@@ -233,6 +268,13 @@ async def process_collection_async(watched_id: int):
 
         session.commit()
 
+        if changed_count:
+            log.info(f"[{watched.slug}] 🔔 [تشخيص كشف] {changed_count} قطعة انكشفت هذي الدورة. "
+                      f"أمثلة: {', '.join(diag_samples)}")
+        if conflict_count:
+            log.warning(f"[{watched.slug}] ⚠️ [تشخيص كشف] إجمالي {conflict_count} حالة تعارض "
+                        f"بين الإشارتين هذي الدورة (راجع التحذيرات فوق للتفاصيل).")
+
         cumulative_revealed_items = list(COLLECTION_METADATA_CACHE[watched.id].items())
         cumulative_count = len(cumulative_revealed_items)
 
@@ -240,13 +282,17 @@ async def process_collection_async(watched_id: int):
 
         from models import Collection
         existing_collection = session.query(Collection).filter_by(slug=watched.slug).first()
-        previous_count = existing_collection.revealed_count if existing_collection else 0
         has_rare_items = existing_collection and len(existing_collection.rare_items) > 0
 
-        if (cumulative_count > previous_count or not has_rare_items) and cumulative_revealed_items:
+        if (changed_count > 0 or (cumulative_count > 0 and not has_rare_items)) and cumulative_revealed_items:
+            t0 = time.monotonic()
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
-                log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة حقيقية!")
+                log.info(f"[{watched.slug}] 🎯 [تشخيص توقيت] حساب الترتيب الكامل لـ "
+                          f"{result['revealed_total']} قطعة: {round(time.monotonic() - t0, 3)} ثانية.")
+
+        total_cycle_time = round(time.monotonic() - cycle_start, 3)
+        log.info(f"[{watched.slug}] ⏱️ [تشخيص] إجمالي وقت هذي الدورة كاملة: {total_cycle_time} ثانية.")
 
     except Exception as e:
         log.error(f"[خطأ معالجة]: {e}")
@@ -256,7 +302,7 @@ async def process_collection_async(watched_id: int):
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة اللاتزمني الخالص.")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع (تشخيص كامل مفعّل).")
 
     while True:
         try:
