@@ -1,5 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity (الخالية تماماً من التعارض الدائري Circular Import).
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد (Pure Internal OpenRarity Engine).
+تزيل تماماً خلط الرتب الجزئية وتعتمد على دقة 8 خانات عشرية لمنع تشوه الترتيب نهائياً.
 """
 
 import hashlib
@@ -22,6 +23,7 @@ def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
     if not total or total <= 0:
         total = 1000
 
+    # حساب النسبة المئوية الصارمة بناءً على الموقع الحقيقي للقطعة بالمصفوفة الفردية
     percentile = ((index + 1) / total) * 100
 
     if percentile <= ORANGE_PERCENT:
@@ -105,15 +107,12 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
+    """
+    حساب نقاط الندرة النظيفة بدقة 8 خانات عشرية لمنع التشوه والخلط.
+    """
     results = []
-    has_any_opensea_rank = False
 
     for nft in nfts:
-        metadata_raw = nft.get("raw_metadata") or nft
-        opensea_rank = extract_opensea_official_rank(metadata_raw)
-        if opensea_rank is not None:
-            has_any_opensea_rank = True
-
         traits = nft.get("traits") or []
         score = 0.0
 
@@ -129,30 +128,28 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             count = freq.get(t_type, {}).get(t_value, 1)
             score += math.log2(total / max(count, 1))
 
+        try:
+            tid_num = int(nft.get("identifier", 0))
+        except Exception:
+            tid_num = 0
+
         results.append({
             "identifier": nft.get("identifier"),
+            "tid_num": tid_num,
             "name": nft.get("name") or f"#{nft.get('identifier')}",
             "opensea_url": nft.get("opensea_url", ""),
             "image_url": nft.get("image_url", ""),
-            "rarity_score": round(score, 4),
-            "opensea_rank": opensea_rank,
+            "rarity_score": round(score, 8),  # دقة 8 خانات عشرية
         })
 
-    if has_any_opensea_rank:
-        results.sort(key=lambda x: (
-            0 if x["opensea_rank"] is not None else 1,
-            x["opensea_rank"] if x["opensea_rank"] is not None else 999999,
-            -x["rarity_score"]
-        ))
-        for item in results:
-            item["rank"] = item["opensea_rank"] if item["opensea_rank"] is not None else 999999
-    else:
-        results.sort(key=lambda x: x["rarity_score"], reverse=True)
-        for i, item in enumerate(results):
-            if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
-                item["rank"] = results[i - 1]["rank"]
-            else:
-                item["rank"] = i + 1
+    # 🎯 فرز داخلي نظيف 100%: الفرز حسب النقاط تنازلياً، ثم حسب رقم التوكين تصاعدياً لكسر التعادل
+    results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
+
+    for i, item in enumerate(results):
+        if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
+            item["rank"] = results[i - 1]["rank"]
+        else:
+            item["rank"] = i + 1
 
     return results
 
@@ -228,37 +225,16 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
     if not revealed_items:
         return {"ok": False, "reason": "no_revealed_yet"}
 
-    # 🛑 استيراد محلي بديل داخل الدالة لمنع أي تعارض دائري (Circular Import) نهائياً
-    from rarity_core import fetch_all_nfts, fetch_best_listings
-
-    opensea_ranks = {}
-    try:
-        opensea_nfts = fetch_all_nfts(watched.slug)
-        for onft in opensea_nfts:
-            tid = str(onft.get("identifier", ""))
-            rarity_obj = onft.get("rarity")
-            if tid and isinstance(rarity_obj, dict):
-                rk = rarity_obj.get("rank")
-                if rk and isinstance(rk, int) and rk > 0:
-                    opensea_ranks[tid] = rk
-    except Exception:
-        pass
-
     pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
     revealed_total = len(pseudo_nfts)
     total_supply = watched.max_supply or revealed_total
 
+    # 🛑 الاعتماد الحصري النظيف على حسابنا الداخلي 100% بدون أي خلط جزئي مع OpenSea
     freq = build_trait_frequency_with_count(pseudo_nfts)
     ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, total=revealed_total)
 
-    if opensea_ranks:
-        for item in ranked:
-            tid_str = str(item["identifier"])
-            if tid_str in opensea_ranks:
-                item["rank"] = opensea_ranks[tid_str]
-        ranked.sort(key=lambda x: x["rank"])
-
     try:
+        from rarity_core import fetch_best_listings
         price_map_eth, _ = fetch_best_listings(watched.slug)
     except Exception:
         price_map_eth = {}
