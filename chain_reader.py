@@ -1,13 +1,11 @@
 """
-وحدة القراءة المباشرة من البلوكشين المعتمدة على بوابة Pinata الخاصة وسباق البوابات السريعة.
+وحدة القراءة المباشرة من البلوكشين المعتمدة على بوابة Pinata الخاصة (Dedicated Gateway) أولاً.
 """
 
 import asyncio
 import base64
 import json
-import logging
 import os
-import time
 import urllib.parse
 import aiohttp
 import requests
@@ -147,8 +145,7 @@ def detect_global_reveal_flag(contract_address: str, chain: str = "ethereum") ->
 async def _fetch_gw(session: aiohttp.ClientSession, url: str) -> dict | None:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RarityRadar/1.0"}
     try:
-        # ⚡ مهلة سريعة 1.2 ثانية كحد أقصى لمنع أي تعليق شبكي
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=1.2)) as resp:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=2)) as resp:
             if resp.status == 200:
                 return await resp.json(content_type=None)
     except Exception:
@@ -181,7 +178,7 @@ async def _async_fetch_single_metadata(session: aiohttp.ClientSession, uri: str)
                 if isinstance(res, dict):
                     return res
 
-            # ⚡ 2. إذا لم تتوفر البوابة الخاصة أو فشلت، نجرب البوابات العامة السريعة
+            # ⚡ 2. إذا لم تتوفر البوابة الخاصة أو فشلت، نجرب البوابات العامة بالتوازي كاحتياطي
             urls = [gw + path for gw in IPFS_GATEWAYS[:3]]
             tasks = [_fetch_gw(session, u) for u in urls]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -192,7 +189,7 @@ async def _async_fetch_single_metadata(session: aiohttp.ClientSession, uri: str)
             return None
 
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) RarityRadar/1.0"}
-        async with session.get(uri, headers=headers, timeout=aiohttp.ClientTimeout(total=2.0)) as resp:
+        async with session.get(uri, headers=headers, timeout=aiohttp.ClientTimeout(total=2.5)) as resp:
             if resp.status == 200:
                 return await resp.json(content_type=None)
         return None
@@ -201,7 +198,7 @@ async def _async_fetch_single_metadata(session: aiohttp.ClientSession, uri: str)
 
 
 async def async_batch_resolve_metadata(uri_map: dict[int, str]) -> dict[int, dict | None]:
-    connector = aiohttp.TCPConnector(limit=200, ttl_dns_cache=300, ssl=False)
+    connector = aiohttp.TCPConnector(limit=150, ttl_dns_cache=300, ssl=False)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
             _async_fetch_single_metadata(session, uri)
@@ -241,7 +238,7 @@ def resolve_metadata(uri: str) -> dict | None:
             dedicated_url = _pinata_dedicated_url(path)
             if dedicated_url:
                 try:
-                    resp = requests.get(dedicated_url, headers=headers, timeout=1.8)
+                    resp = requests.get(dedicated_url, headers=headers, timeout=2)
                     if resp.status_code == 200:
                         return resp.json()
                 except Exception:
@@ -249,16 +246,17 @@ def resolve_metadata(uri: str) -> dict | None:
 
             for gateway in IPFS_GATEWAYS:
                 try:
-                    resp = requests.get(gateway + path, headers=headers, timeout=2.0)
+                    resp = requests.get(gateway + path, headers=headers, timeout=2.5)
                     if resp.status_code == 200:
                         return resp.json()
                 except Exception:
                     continue
             return None
 
-        resp = requests.get(uri, headers=headers, timeout=2.5)
+        resp = requests.get(uri, headers=headers, timeout=3)
         if resp.status_code == 200:
             return resp.json()
         return None
     except Exception:
         return None
+
