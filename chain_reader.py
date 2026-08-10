@@ -1,16 +1,21 @@
 """
-وحدة القراءة المباشرة من البلوكشين المعتمدة على بوابة Pinata الخاصة (Dedicated Gateway) أولاً.
+وحدة القراءة المباشرة من البلوكشين المعتمدة على الاتصال اللاتزمني الأصيل (Pure Async JSON-RPC)
+مع دعم بوابة Pinata الخاصة والبوابات العامة وإلغاء التعارض نهائياً.
 """
 
 import asyncio
 import base64
 import json
+import logging
 import os
+import time
 import urllib.parse
 import aiohttp
 import requests
 from eth_abi import decode as eth_abi_decode, encode as eth_abi_encode
 from web3 import Web3
+
+log = logging.getLogger("chain-reader")
 
 ALCHEMY_ETH_KEY = os.environ.get("ALCHEMY_ETH_KEY") or os.environ.get("ALCHEMY_API_KEY", "")
 ALCHEMY_ROBINHOOD_KEY = os.environ.get("ALCHEMY_ROBINHOOD_KEY", ALCHEMY_ETH_KEY)
@@ -21,20 +26,25 @@ RPC_URLS = {
     "robinhood": f"https://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_ROBINHOOD_KEY}",
 }
 
+WSS_URLS = {
+    "ethereum": f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_ETH_KEY}",
+    "mainnet": f"wss://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_ETH_KEY}",
+    "robinhood": f"wss://robinhood-mainnet.g.alchemy.com/v2/{ALCHEMY_ROBINHOOD_KEY}",
+}
+
 MULTICALL3_ADDRESS = Web3.to_checksum_address("0xcA11bde05977b3631167028862bE2a173976CA11")
 TOKEN_URI_SELECTOR = bytes.fromhex("c87b56dd")
 MULTICALL3_AGGREGATE3_SELECTOR = bytes.fromhex("82ad56cb")
 
-# بوابة Pinata الخاصة المباشرة
 PINATA_GATEWAY_DOMAIN = os.environ.get("PINATA_GATEWAY_DOMAIN", "").strip()
 PINATA_GATEWAY_KEY = os.environ.get("PINATA_GATEWAY_KEY", "").strip()
 
-IPFS_GATEWAYS = [
-    "https://gateway.pinata.cloud/ipfs/",
-    "https://ipfs.io/ipfs/",
-    "https://cloudflare-ipfs.com/ipfs/",
-    "https://ipfs.filebase.io/ipfs/",
-    "https://dweb.link/ipfs/",
+IPFS_GATEWAYS_NAMED = [
+    ("pinata-public", "https://gateway.pinata.cloud/ipfs/"),
+    ("ipfs.io", "https://ipfs.io/ipfs/"),
+    ("cloudflare", "https://cloudflare-ipfs.com/ipfs/"),
+    ("filebase", "https://ipfs.filebase.io/ipfs/"),
+    ("dweb", "https://dweb.link/ipfs/"),
 ]
 
 
@@ -109,7 +119,7 @@ async def async_batch_get_token_uris(contract_address: str, token_ids: list[int]
                                 except Exception:
                                     pass
     except Exception as e:
-        print(f"[async_batch_get_token_uris error on {chain_key}]: {e}")
+        log.error(f"[async_batch_get_token_uris error on {chain_key}]: {e}")
 
     return output
 
@@ -171,15 +181,15 @@ async def _async_fetch_single_metadata(session: aiohttp.ClientSession, uri: str)
             if path.startswith("ipfs/"):
                 path = path[5:]
 
-            # ⚡ 1. الاستعلام الفوري المباشر أولاً من بوابة Pinata الخاصة لسرعة ميكروثانية
+            # 1. الاستعلام المباشر من Pinata Dedicated أولاً إن وجدت
             dedicated_url = _pinata_dedicated_url(path)
             if dedicated_url:
                 res = await _fetch_gw(session, dedicated_url)
                 if isinstance(res, dict):
                     return res
 
-            # ⚡ 2. إذا لم تتوفر البوابة الخاصة أو فشلت، نجرب البوابات العامة بالتوازي كاحتياطي
-            urls = [gw + path for gw in IPFS_GATEWAYS[:3]]
+            # 2. الاستعلام المتوازي الاحتياطي
+            urls = [base + path for _, base in IPFS_GATEWAYS_NAMED[:3]]
             tasks = [_fetch_gw(session, u) for u in urls]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -244,9 +254,9 @@ def resolve_metadata(uri: str) -> dict | None:
                 except Exception:
                     pass
 
-            for gateway in IPFS_GATEWAYS:
+            for _, base in IPFS_GATEWAYS_NAMED:
                 try:
-                    resp = requests.get(gateway + path, headers=headers, timeout=2.5)
+                    resp = requests.get(base + path, headers=headers, timeout=2.5)
                     if resp.status_code == 200:
                         return resp.json()
                 except Exception:
@@ -259,4 +269,3 @@ def resolve_metadata(uri: str) -> dict | None:
         return None
     except Exception:
         return None
-
