@@ -18,7 +18,7 @@ app = Flask(__name__)
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 _prices_cache = {"data": {}, "fetched_at": 0}
-PRICES_CACHE_TTL = 10
+PRICES_CACHE_TTL = 2
 
 
 def slug_from_input(raw: str) -> str:
