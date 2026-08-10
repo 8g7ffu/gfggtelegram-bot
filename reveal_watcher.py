@@ -1,19 +1,17 @@
 """
-محرك المراقبة الجارف - مصدر واحد فقط: البلوكشين/IPFS مباشرة، مع تشخيص كامل واستعلام On-Chain MaxSupply.
+محرك المراقبة الذكي المزود بالتعبئة التلقائية للأصفار المسبقة (Zero-Padding Auto-Formater).
 """
 
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 
-from eth_abi import decode as eth_abi_decode
-from web3 import Web3
-
 from models import RevealTrack, WatchedCollection, SessionLocal, init_db
 from chain_reader import (async_batch_get_token_uris, resolve_metadata,
-                          async_batch_resolve_metadata, detect_global_reveal_flag, get_web3)
+                          async_batch_resolve_metadata, detect_global_reveal_flag)
 from rarity_core import fetch_max_supply, fetch_drop_status
 from rarity_storage import (recompute_from_chain_data, ensure_collection_placeholder,
                              content_signature, is_placeholder_fallback,
@@ -37,67 +35,33 @@ def is_dynamic_url(uri: str) -> bool:
     return uri.startswith("http://") or uri.startswith("https://")
 
 
-def resolve_max_supply(watched: WatchedCollection) -> int:
-    """
-    استعلام السقف الأقصى والعدد اللحظي المصكوك من عقد البلوكشين أولاً،
-    ثم الاستعلام من OpenSea API كاحتياطي ثانٍ.
-    """
-    chain = watched.chain or "ethereum"
-
-    # 1. فحص دوال السقف الأقصى والسك المباشر على البلوكشين (On-Chain Calls)
-    # selectors: totalSupply() = 0x18160ddd, maxSupply() = 0xd5abeb01, MAX_SUPPLY() = 0xd368b122, maxTokens() = 0x3a4b66f1
-    selectors = [
-        bytes.fromhex("18160ddd"),  # totalSupply() - المعروض الحقيقي المصكوك حالياً
-        bytes.fromhex("d5abeb01"),  # maxSupply()
-        bytes.fromhex("d368b122"),  # MAX_SUPPLY()
-        bytes.fromhex("3a4b66f1"),  # maxTokens()
-    ]
-
-    try:
-        w3 = get_web3(chain)
-        checksum_addr = Web3.to_checksum_address(watched.contract_address)
-
-        for sel in selectors:
-            try:
-                res = w3.eth.call({"to": checksum_addr, "data": sel})
-                if res and len(res) == 32:
-                    (on_chain_sp,) = eth_abi_decode(["uint256"], res)
-                    if on_chain_sp and on_chain_sp > 0:
-                        return int(on_chain_sp)
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    # 2. الاستعلام الاحتياطي من OpenSea API
-    try:
-        supply = fetch_max_supply(watched.slug)
-        if supply and supply > 0:
-            return supply
-        drop_status = fetch_drop_status(watched.slug)
-        if drop_status:
-            for key in ("max_supply", "total_supply"):
-                if drop_status.get(key) and int(drop_status[key]) > 0:
-                    return int(drop_status[key])
-    except Exception:
-        pass
-
-    return watched.max_supply or 10000
+def resolve_max_supply(watched: WatchedCollection) -> int | None:
+    supply = fetch_max_supply(watched.slug)
+    if supply:
+        return supply
+    drop_status = fetch_drop_status(watched.slug)
+    if drop_status:
+        for key in ("max_supply", "total_supply"):
+            if drop_status.get(key):
+                return int(drop_status[key])
+    return None
 
 
 def ensure_tracks(session, watched: WatchedCollection) -> bool:
-    """تتبع وتوسيع ديناميكي لصفوف المينت فور زيادة السك بالبلوكشين."""
-    latest_supply = resolve_max_supply(watched)
+    if not watched.max_supply:
+        max_supply = resolve_max_supply(watched)
+        if not max_supply:
+            watched.failed_attempts += 1
+            session.commit()
+            if watched.failed_attempts <= 3 or watched.failed_attempts % 10 == 0:
+                log.warning(f"[{watched.slug}] تعذر تحديد max_supply "
+                            f"(محاولة {watched.failed_attempts}) - سيتم إعادة المحاولة...")
+            return False
 
-    if not watched.max_supply or latest_supply > watched.max_supply:
-        old_supply = watched.max_supply or 0
-        watched.max_supply = latest_supply
+        watched.max_supply = max_supply
         watched.failed_attempts = 0
         session.commit()
-        if old_supply > 0:
-            log.info(f"[{watched.slug}] ⚡ تحديث السقف الأقصى من البلوكشين: {old_supply} 👈 {latest_supply}")
-        else:
-            log.info(f"[{watched.slug}] الحد الأقصى للعرض المقرر: {latest_supply}")
+        log.info(f"[{watched.slug}] الحد الأقصى للعرض: {max_supply}")
         ensure_collection_placeholder(session, watched, revealed_count=0)
 
     existing_count = session.query(RevealTrack).filter_by(watched_id=watched.id).count()
@@ -115,7 +79,7 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
     if new_tracks:
         session.bulk_save_objects(new_tracks)
         session.commit()
-        log.info(f"[{watched.slug}] ⚡ تم تجهيز وإدخال {len(new_tracks)} صف تتبع بسرعة فائقة.")
+        log.info(f"[{watched.slug}] ⚡ تم تجهيز {len(new_tracks)} صف تتبع بسرعة فائقة.")
     return True
 
 
@@ -130,26 +94,38 @@ def check_global_flag(session, watched: WatchedCollection):
                       f"{'انكشفت بالكامل' if flag else 'لسا ما انكشفت'}.")
 
 
-def detect_base_uri_pattern_smart(sample_uris: dict[int, str]) -> str | None:
-    valid_uris = [uri for uri in sample_uris.values() if uri]
+def detect_base_uri_pattern_smart(sample_uris: dict[int, str]) -> tuple[str | None, int]:
+    """
+    اكتشاف ذكي للنمط مع تحديد طول الأصفار المسبقة (padding_width) لمنع أخطاء الـ 404 للأرقام > 9.
+    يرجع (pattern_template, padding_width)
+    """
+    valid_uris = {tid: uri for tid, uri in sample_uris.items() if uri}
     if not valid_uris:
-        return None
+        return None, 0
 
-    if len(set(valid_uris)) == 1 and len(valid_uris) > 1:
-        return None
+    if len(set(valid_uris.values())) == 1 and len(valid_uris) > 1:
+        return None, 0
 
-    for tid, uri in sample_uris.items():
-        if not uri:
-            continue
+    for tid, uri in valid_uris.items():
         str_tid = str(tid)
-        if str_tid in uri:
+        match = re.search(r'(0*)' + re.escape(str_tid) + r'(\.[a-zA-Z0-9]+)?$', uri)
+        if match:
+            zeros = match.group(1)
+            ext = match.group(2) or ""
+            padding_width = len(zeros) + len(str_tid)
+            
+            full_match = zeros + str_tid + ext
+            pattern_parts = uri.rsplit(full_match, 1)
+            candidate_pattern = "{id}" + ext
+            pattern_template = pattern_parts[0] + candidate_pattern
+            
+            return pattern_template, padding_width
+
+        elif str_tid in uri:
             pattern_parts = uri.rsplit(str_tid, 1)
-            candidate_pattern = "{id}".join(pattern_parts)
-            for other_tid, other_uri in sample_uris.items():
-                if other_tid != tid and other_uri:
-                    if candidate_pattern.replace("{id}", str(other_tid)) == other_uri:
-                        return candidate_pattern
-    return None
+            return "{id}".join(pattern_parts), 0
+
+    return None, 0
 
 
 async def process_collection_async(watched_id: int):
@@ -194,15 +170,16 @@ async def process_collection_async(watched_id: int):
         log.info(f"[{watched.slug}] [تشخيص توقيت] جلب عيّنة الأنماط ({len(sample_ids)} قطعة): "
                   f"{round(time.monotonic() - t0, 3)} ثانية.")
 
-        detected_pattern = detect_base_uri_pattern_smart(sample_uris)
+        detected_pattern, padding_width = detect_base_uri_pattern_smart(sample_uris)
         if detected_pattern:
-            log.info(f"[{watched.slug}] [تشخيص نمط] اكتُشف نمط متسلسل: {detected_pattern[:80]}")
+            log.info(f"[{watched.slug}] [تشخيص نمط] اكتُشف نمط متسلسل: {detected_pattern[:80]} (الأصفار: {padding_width})")
 
         t0 = time.monotonic()
         if detected_pattern:
             for tid in token_ids:
                 track = tracks_by_id[tid]
-                computed_uri = detected_pattern.replace("{id}", str(tid))
+                formatted_tid = str(tid).zfill(padding_width) if padding_width > 0 else str(tid)
+                computed_uri = detected_pattern.replace("{id}", formatted_tid)
                 if not track.revealed or track.last_uri != computed_uri:
                     track.last_uri = computed_uri
                     track.content_checked_at = now
@@ -224,11 +201,7 @@ async def process_collection_async(watched_id: int):
                         track.content_checked_at = now
                         uris_to_fetch[token_id] = uri
 
-        try:
-            session.commit()
-        except Exception:
-            session.rollback()
-
+        session.commit()
         log.info(f"[{watched.slug}] [تشخيص توقيت] جلب كل روابط tokenURI: "
                   f"{round(time.monotonic() - t0, 3)} ثانية ({len(uris_to_fetch)} تحتاج فحص محتوى).")
 
@@ -250,11 +223,9 @@ async def process_collection_async(watched_id: int):
                 track = tracks_by_id[token_id]
                 sig = content_signature(metadata)
                 fetched_this_cycle.append((track, metadata, sig))
+                COLLECTION_METADATA_CACHE[watched.id][token_id] = metadata
 
-        try:
-            session.commit()
-        except Exception:
-            session.rollback()
+        session.commit()
 
         if not watched.baseline_locked and fetched_this_cycle:
             signatures = [sig for _, _, sig in fetched_this_cycle]
@@ -262,18 +233,12 @@ async def process_collection_async(watched_id: int):
             if baseline:
                 watched.baseline_signature = baseline
                 watched.baseline_locked = True
-                try:
-                    session.commit()
-                except Exception:
-                    session.rollback()
+                session.commit()
                 log.info(f"[{watched.slug}] 🔒 [تشخيص كشف] حُدّد الشكل الموحّد (baseline) من {len(signatures)} عيّنة.")
             elif len(signatures) >= 15:
                 watched.baseline_locked = True
                 watched.baseline_signature = None
-                try:
-                    session.commit()
-                except Exception:
-                    session.rollback()
+                session.commit()
                 log.info(f"[{watched.slug}] 🔓 [تشخيص كشف] المجموعة منكشفة بالكامل (كل القطع فريدة، ولا baseline).")
 
         changed_count = 0
@@ -312,10 +277,7 @@ async def process_collection_async(watched_id: int):
             elif track.token_id in COLLECTION_METADATA_CACHE[watched.id]:
                 del COLLECTION_METADATA_CACHE[watched.id][track.token_id]
 
-        try:
-            session.commit()
-        except Exception:
-            session.rollback()
+        session.commit()
 
         if changed_count:
             log.info(f"[{watched.slug}] 🔔 [تشخيص كشف] {changed_count} قطعة انكشفت هذي الدورة. "
@@ -346,15 +308,12 @@ async def process_collection_async(watched_id: int):
     except Exception as e:
         log.error(f"[خطأ معالجة]: {e}")
     finally:
-        try:
-            session.close()
-        except Exception:
-            pass
+        session.close()
 
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف السريع (تشخيص كامل مفعّل + On-Chain MaxSupply).")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع مع التنسيق الذكي للأصفار المسبقة.")
 
     while True:
         try:
