@@ -1,6 +1,6 @@
 """
 وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد (Pure Internal OpenRarity Engine).
-تزيل تماماً خلط الرتب الجزئية والتعارض الدائري وتضمن بدقة 8 خانات عشرية ترتيباً صافياً 100%.
+تزيل تماماً خلط الرتب الجزئية وتعتمد على دقة 8 خانات عشرية مع معالجة حقيقية لأسعار USDC و ETH.
 """
 
 import hashlib
@@ -23,6 +23,7 @@ def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
     if not total or total <= 0:
         total = 1000
 
+    # حساب النسبة المئوية الصارمة بناءً على الموقع الحقيقي للقطعة بالمصفوفة الفردية
     percentile = ((index + 1) / total) * 100
 
     if percentile <= ORANGE_PERCENT:
@@ -33,7 +34,6 @@ def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
 
 
 def extract_traits_generic(metadata: dict) -> list:
-    """استخراج مرن ومحمي 100% لكل أنواع وهياكل الـ JSON الممكنة."""
     if not isinstance(metadata, dict):
         return []
 
@@ -107,7 +107,9 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
-    """حساب نقاط الندرة الصافية بدقة 8 خانات عشرية مع تفادي أي تعاطي خاطئ مع الرتب الخارجية."""
+    """
+    حساب نقاط الندرة النظيفة بدقة 8 خانات عشرية لمنع التشوه والخلط.
+    """
     results = []
 
     for nft in nfts:
@@ -137,10 +139,10 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "name": nft.get("name") or f"#{nft.get('identifier')}",
             "opensea_url": nft.get("opensea_url", ""),
             "image_url": nft.get("image_url", ""),
-            "rarity_score": round(score, 8),
+            "rarity_score": round(score, 8),  # دقة 8 خانات عشرية
         })
 
-    # فرز داخلي نظيف 100% حسب نقاط الندرة، مع التوكين لكسر التعادل الحتمي
+    # 🎯 فرز داخلي نظيف 100%: الفرز حسب النقاط تنازلياً، ثم حسب رقم التوكين تصاعدياً لكسر التعادل
     results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
 
     for i, item in enumerate(results):
@@ -223,17 +225,16 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
     if not revealed_items:
         return {"ok": False, "reason": "no_revealed_yet"}
 
-    # استيراد محلي بديل داخل الدالة للوقاية التامة من أي تعارض دائري
-    from rarity_core import fetch_best_listings
-
     pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
     revealed_total = len(pseudo_nfts)
     total_supply = watched.max_supply or revealed_total
 
+    # 🛑 الاعتماد الحصري النظيف على حسابنا الداخلي 100% بدون أي خلط جزئي مع OpenSea
     freq = build_trait_frequency_with_count(pseudo_nfts)
     ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, total=revealed_total)
 
     try:
+        from rarity_core import fetch_best_listings
         price_map_eth, _ = fetch_best_listings(watched.slug)
     except Exception:
         price_map_eth = {}
@@ -264,11 +265,22 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
         if tier is None:
             continue
 
-        price_eth = price_map_eth.get(str(item["identifier"])) if isinstance(price_map_eth, dict) else None
-        if price_eth and price_eth > 500:
-            price_eth = None
+        item_price_info = price_map_eth.get(str(item["identifier"])) if isinstance(price_map_eth, dict) else None
+        price_eth = None
+        price_usd = None
 
-        price_usd = (price_eth * eth_usd_rate) if (price_eth is not None and eth_usd_rate) else None
+        # 🎯 استلام السعر بالدولار المباشر بتمييز USDC دون ضربه بـ ETH
+        if isinstance(item_price_info, dict):
+            if item_price_info.get("price_usd_direct") is not None:
+                price_usd = item_price_info["price_usd_direct"]
+            elif item_price_info.get("price_eth") is not None:
+                price_eth = item_price_info["price_eth"]
+                if price_eth <= 500:
+                    price_usd = price_eth * eth_usd_rate if eth_usd_rate else None
+        elif isinstance(item_price_info, (int, float)):
+            if item_price_info <= 500:
+                price_eth = item_price_info
+                price_usd = price_eth * eth_usd_rate if eth_usd_rate else None
 
         session.add(RareItem(
             collection_id=collection.id,
