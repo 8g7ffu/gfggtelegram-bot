@@ -1,5 +1,5 @@
 """
-وحدة مشتركة لجلب قطع مجموعة NFT وجلب العروض الحية المعتمدة رسمياً من OpenSea بدون خلط العملات (ETH/USDC).
+وحدة مشتركة لجلب قطع مجموعة NFT وجلب أرخص عروض الأسعار الحية من OpenSea.
 """
 
 import os
@@ -98,9 +98,7 @@ def compute_rarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict
 
 def fetch_best_listings(slug: str) -> tuple[dict, bool]:
     """
-    جلب قائمة العروض الحية مع التمييز الدقيق بين عملات ETH و USDC/USDT لتفادي ضرب USDC بسعر الإيثر.
-    يرجع (prices_dict, success_bool)
-    prices_dict = { identifier: {"price_eth": float, "price_usd_direct": float} }
+    جلب أرخص سعر معروض فعال لكل قطعة لحل مشكلة الأسعار القديمة المرتفعة.
     """
     prices = {}
     cursor = None
@@ -141,11 +139,15 @@ def fetch_best_listings(slug: str) -> tuple[dict, bool]:
                 if identifier is not None and value is not None:
                     try:
                         raw_val = int(value) / (10 ** decimals)
-                        # 🎯 التمييز الصريح بين العملات المستقرة والإيثر
+                        tid_str = str(identifier)
+
+                        # 🎯 تصفية جالبة لأرخص سعر معروض فعال دائماً
                         if any(stable in currency for stable in ("USDC", "USDT", "USD", "DAI")):
-                            prices[str(identifier)] = {"price_eth": None, "price_usd_direct": raw_val}
+                            if tid_str not in prices or raw_val < prices[tid_str].get("price_usd_direct", 999999):
+                                prices[tid_str] = {"price_eth": None, "price_usd_direct": raw_val}
                         else:
-                            prices[str(identifier)] = {"price_eth": raw_val, "price_usd_direct": None}
+                            if tid_str not in prices or (prices[tid_str].get("price_eth") and raw_val < prices[tid_str]["price_eth"]):
+                                prices[tid_str] = {"price_eth": raw_val, "price_usd_direct": None}
                     except Exception:
                         pass
 
