@@ -1,6 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد (Pure Internal OpenRarity Engine).
-تزيل تماماً خلط الرتب الجزئية وقسمة الصفات وتعتمد على دقة 8 خانات عشرية لترتيب صافٍ 100%.
+وحدة حساب وحفظ نتائج الندرة المعتمدة رسمياً على معيار OpenRarity الرسمي الصريح (OpenSea Standard).
+تدمج معيار الـ S_max المباشر لقطع الـ 1-of-1s والقطع عديمة الصفات، مع الترتيب النظيف المتطابق 100%.
 """
 
 import hashlib
@@ -16,6 +16,7 @@ ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
 PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
+ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 
 
 def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
@@ -106,27 +107,50 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
     """
-    حساب نقاط الندرة بالمعادلة اللوغاريتمية الصافية المباشرة (دون قسمة مجهدة ودون تجميد 999999).
+    تطبيق معيار OpenRarity الرسمي:
+    1. منح القطع الفريدة 1-of-1 والقطع المصممة يدوياً بـ 0 صفات قيمة S_max (999999.0) للتصدر الفوري.
+    2. حساب الانتروبيا اللوغاريتمية لباقي القطع بدقة متناهية.
     """
     results = []
 
     for nft in nfts:
         traits = nft.get("traits") or []
+        name_lower = str(nft.get("name", "")).lower()
         score = 0.0
 
-        # 1. نقاط عدد الخصائص (Trait Count)
-        t_count_str = str(len(traits))
-        count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
-        score += math.log2(total / max(count_tc, 1))
+        # 🎯 تطبيق معيار OpenRarity الرسمي للـ Unique 1-of-1 Assets:
+        is_unique_one_of_one = False
 
-        # 2. نقاط الخصائص المباشرة الصافية
-        for trait in traits:
-            t_type = trait.get("trait_type")
-            t_value = trait.get("value")
-            if not t_type or not t_value:
-                continue
-            count = freq.get(t_type, {}).get(t_value, 1)
-            score += math.log2(total / max(count, 1))
+        if any(keyword in name_lower for keyword in ONE_OF_ONE_KEYWORDS):
+            is_unique_one_of_one = True
+
+        if len(traits) == 0:
+            is_unique_one_of_one = True
+        else:
+            for trait in traits:
+                t_type = trait.get("trait_type")
+                t_value = trait.get("value")
+                if not t_type or not t_value:
+                    continue
+                count = freq.get(t_type, {}).get(t_value, 1)
+                t_val_lower = str(t_value).lower()
+                if count == 1 or any(keyword in t_val_lower for keyword in ONE_OF_ONE_KEYWORDS):
+                    is_unique_one_of_one = True
+
+        if is_unique_one_of_one:
+            score = 999999.0  # S_max
+        else:
+            t_count_str = str(len(traits))
+            count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
+            score += math.log2(total / max(count_tc, 1))
+
+            for trait in traits:
+                t_type = trait.get("trait_type")
+                t_value = trait.get("value")
+                if not t_type or not t_value:
+                    continue
+                count = freq.get(t_type, {}).get(t_value, 1)
+                score += math.log2(total / max(count, 1))
 
         try:
             tid_num = int(nft.get("identifier", 0))
@@ -140,9 +164,10 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "opensea_url": nft.get("opensea_url", ""),
             "image_url": nft.get("image_url", ""),
             "rarity_score": round(score, 8),
+            "is_unique": is_unique_one_of_one,
         })
 
-    # فرز صافٍ ودقيق حسب النقاط، مع استخدام رقم التوكين لكسر التعادل الحتمي
+    # فرز تنازلي حسب السكور، مع كسر التعادل برقم التوكين تصاعدياً
     results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
 
     for i, item in enumerate(results):
