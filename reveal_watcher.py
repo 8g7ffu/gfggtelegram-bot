@@ -1,5 +1,14 @@
 """
 محرك المراقبة الجارف المباشر من البلوكشين الذكي مع حماية On-Chain MaxSupply و Zero-Padding.
+
+تعديلان محددان فقط عن النسخة السابقة (بدون أي لمس لمنطق الكشف أو حساب
+الندرة، اللي أثبت نجاحه):
+1. أُزيل حاجز "مؤشر العقد" (global_revealed_flag) اللي كان يوقف الفحص
+   بالكامل لو رجع False - لأن الـ selectors المستخدمة غير موثّقة رياضيًا
+   100%، واحتمال تصادمها مع دالة مختلفة على عقد آخر وارد فعليًا. صار
+   المؤشر إعلامي فقط بالـ Logs، ما يوقف أي شي.
+2. استُعيد تسجيل الأخطاء (كان مُسكتًا بالكامل بـ `except: pass`) - أي
+   خطأ مستقبلي لازم يظهر بالسجل، وإلا رجعنا لمرحلة "التخمين بدون دليل".
 """
 
 import asyncio
@@ -115,14 +124,21 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
 
 
 def check_global_flag(session, watched: WatchedCollection):
+    """
+    ⚠️ إعلامي فقط بالـ Logs - لا يُستخدم أبدًا لإيقاف أي فحص.
+    الـ selectors هنا (66c8913d / f209c13e) غير موثّقة رياضيًا 100%،
+    واحتمال تصادمها بالغلط مع دالة مختلفة على عقد آخر وارد فعليًا،
+    فالاعتماد عليها كحاجز يوقف الفحص بالكامل كان يسبب تجاهل مجموعات
+    منكشفة فعليًا لمجرد رد خاطئ من هذا المؤشر غير المؤكد.
+    """
     chain = watched.chain or "ethereum"
     flag = detect_global_reveal_flag(watched.contract_address, chain=chain)
     if flag != watched.global_revealed_flag:
         watched.global_revealed_flag = flag
         session.commit()
         if flag is not None:
-            log.info(f"[{watched.slug}] 📡 مؤشر معلن من العقد نفسه ({chain}): "
-                      f"{'انكشفت بالكامل' if flag else 'لسا ما انكشفت'}.")
+            log.info(f"[{watched.slug}] 📡 [إعلامي فقط، غير مُعتمَد كحاجز] مؤشر من العقد ({chain}): "
+                      f"{'انكشفت' if flag else 'لسا ما انكشفت'}.")
 
 
 def detect_base_uri_pattern_smart(sample_uris: dict[int, str]) -> tuple[str | None, int]:
@@ -174,11 +190,8 @@ async def process_collection_async(watched_id: int):
             return
 
         chain = watched.chain or "ethereum"
+        # إعلامي فقط - لا يوقف أي شي (راجع التنبيه بأعلى الدالة)
         check_global_flag(session, watched)
-
-        if watched.global_revealed_flag is False:
-            ensure_collection_placeholder(session, watched, revealed_count=0)
-            return
 
         if watched.id not in COLLECTION_METADATA_CACHE:
             COLLECTION_METADATA_CACHE[watched.id] = {}
@@ -215,7 +228,8 @@ async def process_collection_async(watched_id: int):
                 chunk = token_ids[i:i + BATCH_SIZE]
                 try:
                     uri_results = await async_batch_get_token_uris(watched.contract_address, chunk, chain)
-                except Exception:
+                except Exception as e:
+                    log.error(f"[{watched.slug}] خطأ بجلب دفعة tokenURI: {e}")
                     continue
 
                 for token_id, uri in uri_results.items():
@@ -229,7 +243,8 @@ async def process_collection_async(watched_id: int):
 
         try:
             session.commit()
-        except Exception:
+        except Exception as e:
+            log.error(f"[{watched.slug}] فشل حفظ روابط tokenURI (تعارض توقيت محتمل): {e}")
             session.rollback()
 
         if not uris_to_fetch:
@@ -248,7 +263,8 @@ async def process_collection_async(watched_id: int):
 
         try:
             session.commit()
-        except Exception:
+        except Exception as e:
+            log.error(f"[{watched.slug}] فشل حفظ الميتاداتا المجلوبة: {e}")
             session.rollback()
 
         if fetched_this_cycle:
@@ -262,7 +278,8 @@ async def process_collection_async(watched_id: int):
                 watched.baseline_locked = True
                 try:
                     session.commit()
-                except Exception:
+                except Exception as e:
+                    log.error(f"[{watched.slug}] فشل حفظ baseline: {e}")
                     session.rollback()
                 log.info(f"[{watched.slug}] 🔒 حُدّد الشكل الموحّد (baseline) من {len(signatures)} عيّنة.")
             elif len(signatures) >= 15:
@@ -270,7 +287,8 @@ async def process_collection_async(watched_id: int):
                 watched.baseline_signature = None
                 try:
                     session.commit()
-                except Exception:
+                except Exception as e:
+                    log.error(f"[{watched.slug}] فشل حفظ حالة baseline: {e}")
                     session.rollback()
                 log.info(f"[{watched.slug}] 🔓 المجموعة منكشفة بالكامل (جميع القطع فريدة).")
 
@@ -295,7 +313,8 @@ async def process_collection_async(watched_id: int):
 
         try:
             session.commit()
-        except Exception:
+        except Exception as e:
+            log.error(f"[{watched.slug}] فشل حفظ حالة الانكشاف: {e}")
             session.rollback()
 
         cumulative_revealed_items = list(COLLECTION_METADATA_CACHE[watched.id].items())
@@ -313,12 +332,18 @@ async def process_collection_async(watched_id: int):
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
                 log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة فوراً!")
+            else:
+                log.warning(f"[{watched.slug}] لم يتم حساب الترتيب: {result.get('reason', 'سبب غير معروف')}")
 
         total_cycle_time = round(time.monotonic() - cycle_start, 3)
         log.info(f"[{watched.slug}] ⏱️ [تشخيص] إجمالي وقت هذي الدورة كاملة: {total_cycle_time} ثانية.")
 
     except Exception as e:
-        pass
+        log.error(f"[معالجة watched_id={watched_id}] خطأ غير متوقع: {e}")
+        try:
+            session.rollback()
+        except Exception:
+            pass
     finally:
         try:
             session.close()
@@ -330,14 +355,14 @@ async def process_collection_with_timeout(watched_id: int):
     try:
         await asyncio.wait_for(process_collection_async(watched_id), timeout=30.0)
     except asyncio.TimeoutError:
-        log.warning(f"[Timeout] فحص الكولكشن استغرق أكثر من 30 ثانية — للانتقال المباشر للدورة التالية.")
-    except Exception:
-        pass
+        log.warning(f"[watched_id={watched_id}] [Timeout] فحص الكولكشن استغرق أكثر من 30 ثانية — الانتقال للدورة التالية.")
+    except Exception as e:
+        log.error(f"[watched_id={watched_id}] خطأ غير متوقع بمهمة المعالجة: {e}")
 
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف السريع اللحظي المباشر.")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع اللحظي المباشر (مؤشر العقد إعلامي فقط، الأخطاء مسجّلة بالكامل).")
 
     while True:
         try:
