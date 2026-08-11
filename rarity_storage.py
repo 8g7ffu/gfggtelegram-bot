@@ -1,6 +1,5 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد (Pure Internal OpenRarity Engine).
-تزيل تماماً خلط الرتب الجزئية وتعتمد على دقة 8 خانات عشرية مع معالجة حقيقية لأسعار USDC و ETH.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على خوارزمية OpenRarity Double Sort الرسمية لـ OpenSea.
 """
 
 import hashlib
@@ -20,10 +19,11 @@ ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "un
 
 
 def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
+    if rank == 1:
+        return "orange"
     if not total or total <= 0:
         total = 1000
 
-    # حساب النسبة المئوية الصارمة بناءً على الموقع الحقيقي للقطعة بالمصفوفة الفردية
     percentile = ((index + 1) / total) * 100
 
     if percentile <= ORANGE_PERCENT:
@@ -106,15 +106,22 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
     return freq
 
 
-def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
+def compute_openrarity_official_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
     """
-    حساب نقاط الندرة النظيفة بدقة 8 خانات عشرية لمنع التشوه والخلط.
+    تطبيق خوارزمية OpenRarity Double Sort الرسمية المعتمدة لدى OpenSea:
+    1. الفرز الأول: أولوية عظمى للقطع التي تملك صفات فريدة count == 1 أو 1/1.
+    2. الفرز الثاني: ترتيب باقي القطع بالانتروبيا اللوغاريتمية.
     """
     results = []
 
     for nft in nfts:
         traits = nft.get("traits") or []
+        name_lower = str(nft.get("name", "")).lower()
         score = 0.0
+        has_unique_trait = False
+
+        if any(keyword in name_lower for keyword in ONE_OF_ONE_KEYWORDS):
+            has_unique_trait = True
 
         t_count_str = str(len(traits))
         count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
@@ -126,28 +133,33 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             if not t_type or not t_value:
                 continue
             count = freq.get(t_type, {}).get(t_value, 1)
-            score += math.log2(total / max(count, 1))
 
-        try:
-            tid_num = int(nft.get("identifier", 0))
-        except Exception:
-            tid_num = 0
+            if count == 1 or any(keyword in str(t_value).lower() for keyword in ONE_OF_ONE_KEYWORDS):
+                has_unique_trait = True
+
+            score += math.log2(total / max(count, 1))
 
         results.append({
             "identifier": nft.get("identifier"),
-            "tid_num": tid_num,
             "name": nft.get("name") or f"#{nft.get('identifier')}",
             "opensea_url": nft.get("opensea_url", ""),
             "image_url": nft.get("image_url", ""),
-            "rarity_score": round(score, 8),  # دقة 8 خانات عشرية
+            "rarity_score": round(score, 4),
+            "has_unique_trait": has_unique_trait
         })
 
-    # 🎯 فرز داخلي نظيف 100%: الفرز حسب النقاط تنازلياً، ثم حسب رقم التوكين تصاعدياً لكسر التعادل
-    results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
+    # 🎯 تطبيق خوارزمية OpenRarity Double Sort الرسمية لـ OpenSea:
+    results.sort(key=lambda x: (1 if x["has_unique_trait"] else 0, x["rarity_score"]), reverse=True)
 
     for i, item in enumerate(results):
-        if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
-            item["rank"] = results[i - 1]["rank"]
+        if i > 0 and (
+            (item["has_unique_trait"] and results[i - 1]["has_unique_trait"]) or
+            (item["rarity_score"] == results[i - 1]["rarity_score"])
+        ):
+            if item["has_unique_trait"] and results[i - 1]["has_unique_trait"]:
+                item["rank"] = 1
+            else:
+                item["rank"] = results[i - 1]["rank"]
         else:
             item["rank"] = i + 1
 
@@ -229,9 +241,8 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
     revealed_total = len(pseudo_nfts)
     total_supply = watched.max_supply or revealed_total
 
-    # 🛑 الاعتماد الحصري النظيف على حسابنا الداخلي 100% بدون أي خلط جزئي مع OpenSea
     freq = build_trait_frequency_with_count(pseudo_nfts)
-    ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, total=revealed_total)
+    ranked = compute_openrarity_official_scores(pseudo_nfts, freq, total=revealed_total)
 
     try:
         from rarity_core import fetch_best_listings
@@ -269,7 +280,6 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
         price_eth = None
         price_usd = None
 
-        # 🎯 استلام السعر بالدولار المباشر بتمييز USDC دون ضربه بـ ETH
         if isinstance(item_price_info, dict):
             if item_price_info.get("price_usd_direct") is not None:
                 price_usd = item_price_info["price_usd_direct"]
