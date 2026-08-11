@@ -364,7 +364,7 @@ async def process_collection_with_timeout(watched_id: int):
         session.close()
 
     # ⚡ احتساب مهلة ديناميكية مرنة حسب حجم المجموعة (تضمن 80 ثانية للمجموعات الـ 10,000)
-    dynamic_timeout = max(30.0, float(max_sup / 1000.0) * 8.0)
+    dynamic_timeout = max(35.0, float(max_sup / 1000.0) * 10.0)
 
     try:
         await asyncio.wait_for(process_collection_async(watched_id), timeout=dynamic_timeout)
