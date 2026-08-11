@@ -352,10 +352,24 @@ async def process_collection_async(watched_id: int):
 
 
 async def process_collection_with_timeout(watched_id: int):
+    session = SessionLocal()
+    max_sup = 10000
     try:
-        await asyncio.wait_for(process_collection_async(watched_id), timeout=30.0)
+        watched = session.query(WatchedCollection).filter_by(id=watched_id, active=True).first()
+        if watched and watched.max_supply:
+            max_sup = watched.max_supply
+    except Exception:
+        pass
+    finally:
+        session.close()
+
+    # ⚡ احتساب مهلة ديناميكية مرنة حسب حجم المجموعة (تضمن 80 ثانية للمجموعات الـ 10,000)
+    dynamic_timeout = max(30.0, float(max_sup / 1000.0) * 8.0)
+
+    try:
+        await asyncio.wait_for(process_collection_async(watched_id), timeout=dynamic_timeout)
     except asyncio.TimeoutError:
-        log.warning(f"[watched_id={watched_id}] [Timeout] فحص الكولكشن استغرق أكثر من 30 ثانية — الانتقال للدورة التالية.")
+        log.warning(f"[watched_id={watched_id}] [Timeout] فحص الكولكشن استغرق أكثر من {dynamic_timeout} ثانية — الانتقال للدورة التالية.")
     except Exception as e:
         log.error(f"[watched_id={watched_id}] خطأ غير متوقع بمهمة المعالجة: {e}")
 
