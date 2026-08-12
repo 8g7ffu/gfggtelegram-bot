@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف المباشر المزود بـ On-Chain maxSupply Priority ودعم التوكينات المبدوءة بـ 0.
+محرك المراقبة الجارف المباشر المخصص للـ IPFS والتراجع المباشر لعقد البلوكشين.
 """
 
 import asyncio
@@ -38,18 +38,14 @@ def is_dynamic_url(uri: str) -> bool:
 
 
 def resolve_max_supply(watched: WatchedCollection) -> int:
-    """
-    استعلام السقف الأقصى الحقيقي للمجموعة من البلوكشين بترتيب maxSupply أولاً ثم totalSupply.
-    """
     chain = watched.chain or "ethereum"
 
-    # 🎯 تقديم استعلام maxSupply() و MAX_SUPPLY() أولاً على البلوكشين قبل totalSupply()
     selectors = [
-        bytes.fromhex("d5abeb01"),  # maxSupply() - السقف الأقصى الحقيقي المكتمل
+        bytes.fromhex("d5abeb01"),  # maxSupply()
         bytes.fromhex("d368b122"),  # MAX_SUPPLY()
         bytes.fromhex("3a4b66f1"),  # maxTokens()
         bytes.fromhex("272b5358"),  # maxCap()
-        bytes.fromhex("18160ddd"),  # totalSupply() - السك الحالي
+        bytes.fromhex("18160ddd"),  # totalSupply()
     ]
 
     try:
@@ -84,9 +80,7 @@ def resolve_max_supply(watched: WatchedCollection) -> int:
 
 
 def get_start_token_id(watched: WatchedCollection, chain: str) -> int:
-    """فحص هل ترقيم العقد يبدأ من 0 أم من 1."""
     try:
-        w3 = get_web3(chain)
         res = async_batch_get_token_uris(watched.contract_address, [0], chain)
         if res and res.get(0) is not None:
             return 0
@@ -241,6 +235,22 @@ async def process_collection_async(watched_id: int):
                         track.content_checked_at = now
                         uris_to_fetch[token_id] = uri
 
+        # 🎯 إذا فشل جزء من التوكينات بالنمط، يجلب عناوين التوكينات المتبقية مباشرة من البلوكشين بنداء فردي
+        unresolved_ids = [tid for tid in token_ids if tid not in uris_to_fetch and not tracks_by_id[tid].revealed]
+        if unresolved_ids and not detected_pattern:
+            for i in range(0, len(unresolved_ids), BATCH_SIZE):
+                chunk = unresolved_ids[i:i + BATCH_SIZE]
+                try:
+                    uri_results = await async_batch_get_token_uris(watched.contract_address, chunk, chain)
+                    for token_id, uri in uri_results.items():
+                        if uri:
+                            track = tracks_by_id[token_id]
+                            track.last_uri = uri
+                            track.content_checked_at = now
+                            uris_to_fetch[token_id] = uri
+                except Exception:
+                    pass
+
         try:
             session.commit()
         except Exception:
@@ -332,12 +342,9 @@ async def process_collection_async(watched_id: int):
         log.info(f"[{watched.slug}] ⏱️ [تشخيص] إجمالي وقت هذي الدورة كاملة: {total_cycle_time} ثانية.")
 
     except Exception as e:
-        pass
+        log.error(f"[خطأ معالجة]: {e}")
     finally:
-        try:
-            session.close()
-        except Exception:
-            pass
+        session.close()
 
 
 async def process_collection_with_timeout(watched_id: int):
@@ -351,7 +358,7 @@ async def process_collection_with_timeout(watched_id: int):
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف المباشر (On-Chain maxSupply Priority + 0-Indexed Support).")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع المباشر النظيف.")
 
     while True:
         try:
