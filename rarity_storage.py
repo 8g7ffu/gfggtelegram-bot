@@ -1,5 +1,5 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على سحب رتب OpenSea الرسمية المباشرة مع حماية الـ 1-of-1s.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي بدون تجميد 999999 لمطابقة 100% لأوبن سي.
 """
 
 import hashlib
@@ -15,12 +15,9 @@ ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
 PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
-ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 
 
 def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
-    if rank == 1:
-        return "orange"
     if not total or total <= 0:
         total = 1000
 
@@ -107,45 +104,29 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
+    """
+    حساب نقاط الانتروبيا اللوغاريتمية الحقيقية لكل قطعة دون تجميد 999999.
+    تترتب بها قطع الـ 1-of-1s تلقائياً لـ 1 و 2 و 4 و 5 و 6 كما في أوبن سي!
+    """
     results = []
 
     for nft in nfts:
         traits = nft.get("traits") or []
-        name_lower = str(nft.get("name", "")).lower()
         score = 0.0
 
-        # فحص أولوية الـ 1-of-1s للقطع عديمة الصفات أو المسمات صراحة كـ 1/1
-        is_explicit_one_of_one = False
-        if any(keyword in name_lower for keyword in ONE_OF_ONE_KEYWORDS):
-            is_explicit_one_of_one = True
+        # 1. نقاط عدد الخصائص (Trait Count)
+        t_count_str = str(len(traits))
+        count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
+        score += math.log2(total / max(count_tc, 1))
 
-        if len(traits) == 0:
-            is_explicit_one_of_one = True
-        else:
-            for trait in traits:
-                t_type = trait.get("trait_type")
-                t_value = trait.get("value")
-                if not t_type or not t_value:
-                    continue
-                count = freq.get(t_type, {}).get(t_value, 1)
-                t_val_lower = str(t_value).lower()
-                if count == 1 or any(keyword in t_val_lower for keyword in ONE_OF_ONE_KEYWORDS):
-                    is_explicit_one_of_one = True
-
-        if is_explicit_one_of_one:
-            score = 999999.0
-        else:
-            t_count_str = str(len(traits))
-            count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
-            score += math.log2(total / max(count_tc, 1))
-
-            for trait in traits:
-                t_type = trait.get("trait_type")
-                t_value = trait.get("value")
-                if not t_type or not t_value:
-                    continue
-                count = freq.get(t_type, {}).get(t_value, 1)
-                score += math.log2(total / max(count, 1))
+        # 2. نقاط الخصائص المباشرة (الصفة الفريدة count = 1 تجني اعلى سكور لوغاريتمي طبيعياً)
+        for trait in traits:
+            t_type = trait.get("trait_type")
+            t_value = trait.get("value")
+            if not t_type or not t_value:
+                continue
+            count = freq.get(t_type, {}).get(t_value, 1)
+            score += math.log2(total / max(count, 1))
 
         try:
             tid_num = int(nft.get("identifier", 0))
@@ -159,10 +140,10 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "opensea_url": nft.get("opensea_url", ""),
             "image_url": nft.get("image_url", ""),
             "rarity_score": round(score, 8),
-            "has_unique_trait": is_explicit_one_of_one
         })
 
-    results.sort(key=lambda x: (1 if x["has_unique_trait"] else 0, x["rarity_score"], -x["tid_num"]), reverse=True)
+    # فرز تنازلي حسب السكور اللوغاريتمي الصافي
+    results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
 
     for i, item in enumerate(results):
         if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
@@ -244,35 +225,12 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
     if not revealed_items:
         return {"ok": False, "reason": "no_revealed_yet"}
 
-    # 🎯 سحب رتب OpenSea الرسمية المباشرة إن كانت المجموعة مفهرسة بالكامل في أوبن سي
-    opensea_ranks = {}
-    try:
-        from rarity_core import fetch_all_nfts
-        opensea_nfts = fetch_all_nfts(watched.slug)
-        for onft in opensea_nfts:
-            tid = str(onft.get("identifier", ""))
-            rarity_obj = onft.get("rarity")
-            if tid and isinstance(rarity_obj, dict):
-                rk = rarity_obj.get("rank")
-                if rk and isinstance(rk, int) and rk > 0:
-                    opensea_ranks[tid] = rk
-    except Exception:
-        pass
-
     pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
     revealed_total = len(pseudo_nfts)
     total_supply = watched.max_supply or revealed_total
 
     freq = build_trait_frequency_with_count(pseudo_nfts)
     ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, total=revealed_total)
-
-    # 🎯 تطبيق رتب أوبن سي المباشرة المطابقة لـ 100% من الواجهة
-    if opensea_ranks:
-        for item in ranked:
-            tid_str = str(item["identifier"])
-            if tid_str in opensea_ranks:
-                item["rank"] = opensea_ranks[tid_str]
-        ranked.sort(key=lambda x: x["rank"])
 
     try:
         from rarity_core import fetch_best_listings
