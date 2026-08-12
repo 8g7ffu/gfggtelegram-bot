@@ -261,7 +261,7 @@ async def run_diagnostics(contract_address: str, chain: str = "robinhood"):
 if __name__ == "__main__":
     # ضع عنوان عقد المجموعة المراد تشخيصها هنا
     # مثال كولكشن Motion على Robinhood
-    TARGET_CONTRACT = "0x..."  # ضع عنوان عقد المجموعة هنا
+    TARGET_CONTRACT = "0x780f5753fe7d66ea135c065a975e578f25c145bd"  # ضع عنوان عقد المجموعة هنا
     TARGET_CHAIN = "robinhood"  # أو "ethereum"
     
     asyncio.run(run_diagnostics(TARGET_CONTRACT, TARGET_CHAIN))
