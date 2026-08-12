@@ -1,6 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity الشامل (Universal Canonical OpenRarity Engine).
-تستخرج الخصائص من الجذر (Root-Level) والقواميس والقوائم المسطحة لجميع أنواع الهياكل دون أي استثناء.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity الشامل المدمج (Universal Additive OpenRarity Engine).
+تستوعب جميع احتمالات وهياكل ملفات الـ JSON والـ 1-of-1s وأنماط المطورين التراكمية دون أي تعارض.
 """
 
 import hashlib
@@ -16,10 +16,13 @@ ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
 PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
+ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 ROOT_LEVEL_TRAIT_KEYS = ("type", "category", "gender", "style", "kind", "class", "rarity_tier", "archetype")
 
 
 def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
+    if rank == 1:
+        return "orange"
     if not total or total <= 0:
         total = 1000
 
@@ -34,7 +37,7 @@ def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
 
 def extract_traits_generic(metadata: dict) -> list:
     """
-    مستخرج الخصائص الشامل (Universal Canonical Trait Extractor):
+    مستخرج الخصائص الشامل المدمج (Universal Additive Trait Extractor):
     يجرف الخصائص من الجذر (Root-Level)، والقواميس، والقوائم المسطحة، والأنماط المعقدة.
     """
     if not isinstance(metadata, dict):
@@ -56,7 +59,7 @@ def extract_traits_generic(metadata: dict) -> list:
                         seen_pairs.add(pair)
                         valid_traits.append({"trait_type": t_type, "value": t_val})
 
-    # 2. البحث في حقول الخصائص العادية والداخلية (attributes, traits, properties)
+    # 2. البحث في حقول الخصائص العادية والداخلية (attributes, traits, properties, meta)
     raw_traits = (
         metadata.get("traits") or
         metadata.get("attributes") or
@@ -83,7 +86,6 @@ def extract_traits_generic(metadata: dict) -> list:
                         valid_traits.append({"trait_type": t_type, "value": t_val})
 
             elif isinstance(t, (str, int, float)):
-                # قوائم النصوص المسطحة مثل ["Alien", "Pipe", "Mohawk"]
                 t_val = str(t).strip()
                 if t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
                     pair = ("Property", t_val)
@@ -143,27 +145,47 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
     """
-    حساب نقاط الانتروبيا اللوغاريتمية الرياضية الشاملة لكل القطع بدقة 8 خانات عشرية.
+    حساب نقاط الانتروبيا اللوغاريتمية المعيارية مع معالجة الـ 1-of-1s والقطع بـ 0 صفات.
     """
     results = []
 
     for nft in nfts:
         traits = nft.get("traits") or []
+        name_lower = str(nft.get("name", "")).lower()
         score = 0.0
 
-        # 1. انتروبيا عدد الخصائص (Trait Count Entropy)
-        t_count_str = str(len(traits))
-        count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
-        score += math.log2(total / max(count_tc, 1))
+        # 🎯 كاشف الـ 1-of-1s الشامل (بالاسم أو بـ 0 صفات أو بالصفة الفريدة)
+        is_unique_one_of_one = False
+        if any(keyword in name_lower for keyword in ONE_OF_ONE_KEYWORDS):
+            is_unique_one_of_one = True
 
-        # 2. انتروبيا الخصائص المجروفة الشاملة
-        for trait in traits:
-            t_type = trait.get("trait_type")
-            t_value = trait.get("value")
-            if not t_type or not t_value:
-                continue
-            count = freq.get(t_type, {}).get(t_value, 1)
-            score += math.log2(total / max(count, 1))
+        if len(traits) == 0:
+            is_unique_one_of_one = True
+        else:
+            for trait in traits:
+                t_type = trait.get("trait_type")
+                t_value = trait.get("value")
+                if not t_type or not t_value:
+                    continue
+                count = freq.get(t_type, {}).get(t_value, 1)
+                t_val_lower = str(t_value).lower()
+                if count == 1 or any(keyword in t_val_lower for keyword in ONE_OF_ONE_KEYWORDS):
+                    is_unique_one_of_one = True
+
+        if is_unique_one_of_one:
+            score = 999999.0
+        else:
+            t_count_str = str(len(traits))
+            count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
+            score += math.log2(total / max(count_tc, 1))
+
+            for trait in traits:
+                t_type = trait.get("trait_type")
+                t_value = trait.get("value")
+                if not t_type or not t_value:
+                    continue
+                count = freq.get(t_type, {}).get(t_value, 1)
+                score += math.log2(total / max(count, 1))
 
         try:
             tid_num = int(nft.get("identifier", 0))
@@ -177,10 +199,11 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "opensea_url": nft.get("opensea_url", ""),
             "image_url": nft.get("image_url", ""),
             "rarity_score": round(score, 8),
+            "has_unique_trait": is_unique_one_of_one,
         })
 
-    # فرز تنازلي حسب النقاط اللوغاريتمية الشاملة، وكسر التعادل برقم التوكين
-    results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
+    # فرز تنازلي حسب الأولوية والسكور اللوغاريتمي، مع كسر التعادل برقم التوكين
+    results.sort(key=lambda x: (1 if x["has_unique_trait"] else 0, x["rarity_score"], -x["tid_num"]), reverse=True)
 
     for i, item in enumerate(results):
         if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
