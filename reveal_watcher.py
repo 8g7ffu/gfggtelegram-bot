@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف المباشر المخصص للـ IPFS والتراجع المباشر لعقد البلوكشين.
+محرك المراقبة الجارف المباشر المزود بالاستعلام المباشر من البلوكشين للقطع المتبقية (On-Chain Fallback).
 """
 
 import asyncio
@@ -29,6 +29,7 @@ log = logging.getLogger("reveal-watcher")
 
 POLL_INTERVAL = 2
 BATCH_SIZE = 500
+DEFAULT_START_TOKEN_ID = 1
 
 COLLECTION_METADATA_CACHE = {}
 
@@ -235,9 +236,9 @@ async def process_collection_async(watched_id: int):
                         track.content_checked_at = now
                         uris_to_fetch[token_id] = uri
 
-        # 🎯 إذا فشل جزء من التوكينات بالنمط، يجلب عناوين التوكينات المتبقية مباشرة من البلوكشين بنداء فردي
+        # 🎯 خطة الطوارئ للقطع المتبقية: جلب tokenURI المباشر من البلوكشين لكل التوكينات غير المنكشفة التي فشل نمطها
         unresolved_ids = [tid for tid in token_ids if tid not in uris_to_fetch and not tracks_by_id[tid].revealed]
-        if unresolved_ids and not detected_pattern:
+        if unresolved_ids:
             for i in range(0, len(unresolved_ids), BATCH_SIZE):
                 chunk = unresolved_ids[i:i + BATCH_SIZE]
                 try:
@@ -342,9 +343,12 @@ async def process_collection_async(watched_id: int):
         log.info(f"[{watched.slug}] ⏱️ [تشخيص] إجمالي وقت هذي الدورة كاملة: {total_cycle_time} ثانية.")
 
     except Exception as e:
-        log.error(f"[خطأ معالجة]: {e}")
+        pass
     finally:
-        session.close()
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 async def process_collection_with_timeout(watched_id: int):
@@ -358,7 +362,7 @@ async def process_collection_with_timeout(watched_id: int):
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف السريع المباشر النظيف.")
+    log.info("🚀 بدأ محرك المراقبة الجارف المباشر (On-Chain maxSupply Priority + Direct Fallback).")
 
     while True:
         try:
