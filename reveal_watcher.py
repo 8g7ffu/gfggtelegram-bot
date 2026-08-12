@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف - مصدر واحد فقط: البلوكشين/IPFS مباشرة، مع تشخيص كامل واستعلام On-Chain MaxSupply وتوسيع حقيقي.
+محرك المراقبة الجارف المباشر المزود بـ On-Chain maxSupply Priority ودعم التوكينات المبدوءة بـ 0.
 """
 
 import asyncio
@@ -29,7 +29,6 @@ log = logging.getLogger("reveal-watcher")
 
 POLL_INTERVAL = 2
 BATCH_SIZE = 500
-DEFAULT_START_TOKEN_ID = 1
 
 COLLECTION_METADATA_CACHE = {}
 
@@ -39,14 +38,18 @@ def is_dynamic_url(uri: str) -> bool:
 
 
 def resolve_max_supply(watched: WatchedCollection) -> int:
-    """استعلام المعروض الحقيقي المباشر من البلوكشين أولاً."""
+    """
+    استعلام السقف الأقصى الحقيقي للمجموعة من البلوكشين بترتيب maxSupply أولاً ثم totalSupply.
+    """
     chain = watched.chain or "ethereum"
 
+    # 🎯 تقديم استعلام maxSupply() و MAX_SUPPLY() أولاً على البلوكشين قبل totalSupply()
     selectors = [
-        bytes.fromhex("18160ddd"),  # totalSupply()
-        bytes.fromhex("d5abeb01"),  # maxSupply()
+        bytes.fromhex("d5abeb01"),  # maxSupply() - السقف الأقصى الحقيقي المكتمل
         bytes.fromhex("d368b122"),  # MAX_SUPPLY()
         bytes.fromhex("3a4b66f1"),  # maxTokens()
+        bytes.fromhex("272b5358"),  # maxCap()
+        bytes.fromhex("18160ddd"),  # totalSupply() - السك الحالي
     ]
 
     try:
@@ -80,6 +83,18 @@ def resolve_max_supply(watched: WatchedCollection) -> int:
     return watched.max_supply or 10000
 
 
+def get_start_token_id(watched: WatchedCollection, chain: str) -> int:
+    """فحص هل ترقيم العقد يبدأ من 0 أم من 1."""
+    try:
+        w3 = get_web3(chain)
+        res = async_batch_get_token_uris(watched.contract_address, [0], chain)
+        if res and res.get(0) is not None:
+            return 0
+    except Exception:
+        pass
+    return 1
+
+
 def ensure_tracks(session, watched: WatchedCollection) -> bool:
     latest_supply = resolve_max_supply(watched)
 
@@ -91,7 +106,7 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
         if old_supply > 0:
             log.info(f"[{watched.slug}] ⚡ تحديث السقف الأقصى من البلوكشين: {old_supply} 👈 {latest_supply}")
         else:
-            log.info(f"[{watched.slug}] الحد الأقصى للعرض: {latest_supply}")
+            log.info(f"[{watched.slug}] ⚡ السقف الأقصى المحدد من البلوكشين: {latest_supply}")
         ensure_collection_placeholder(session, watched, revealed_count=0)
 
     existing_count = session.query(RevealTrack).filter_by(watched_id=watched.id).count()
@@ -101,15 +116,19 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
     existing_ids = {t.token_id for t in session.query(RevealTrack.token_id)
                     .filter_by(watched_id=watched.id).all()}
 
+    chain = watched.chain or "ethereum"
+    start_id = get_start_token_id(watched, chain)
+
     new_tracks = []
-    for token_id in range(DEFAULT_START_TOKEN_ID, DEFAULT_START_TOKEN_ID + watched.max_supply):
+    for token_id in range(start_id, start_id + watched.max_supply):
         if token_id not in existing_ids:
             new_tracks.append(RevealTrack(watched_id=watched.id, token_id=token_id))
 
     if new_tracks:
         session.bulk_save_objects(new_tracks)
         session.commit()
-        log.info(f"[{watched.slug}] ⚡ تم إدخال وتوسيع {len(new_tracks)} صف تتبع جديد للقطع المصكوكة.")
+        log.info(f"[{watched.slug}] ⚡ تم إدخال وتوسيع {len(new_tracks)} صف تتبع جديد للقطع (البداية من #{start_id}).")
+
     return True
 
 
@@ -120,7 +139,7 @@ def check_global_flag(session, watched: WatchedCollection):
         watched.global_revealed_flag = flag
         session.commit()
         if flag is not None:
-            log.info(f"[{watched.slug}] 📡 [إعلامي فقط، غير مُعتمَد كحاجز] مؤشر من العقد ({chain}): "
+            log.info(f"[{watched.slug}] 📡 [إعلامي فقط] مؤشر من العقد ({chain}): "
                       f"{'انكشفت' if flag else 'لسا ما انكشفت'}.")
 
 
@@ -188,20 +207,14 @@ async def process_collection_async(watched_id: int):
         uris_to_fetch = {}
         now = datetime.now(timezone.utc)
 
-        sample_ids = [tid for tid in [1, 2, 5, 10, 20, 50, 100] if tid in tracks_by_id]
+        sample_ids = [tid for tid in [0, 1, 2, 5, 10, 20, 50, 100] if tid in tracks_by_id]
         if not sample_ids:
             sample_ids = token_ids[:5]
 
-        t0 = time.monotonic()
         sample_uris = await async_batch_get_token_uris(watched.contract_address, sample_ids, chain)
-        log.info(f"[{watched.slug}] [تشخيص توقيت] جلب عيّنة الأنماط ({len(sample_ids)} قطعة): "
-                  f"{round(time.monotonic() - t0, 3)} ثانية.")
 
         detected_pattern, padding_width = detect_base_uri_pattern_smart(sample_uris)
-        if detected_pattern:
-            log.info(f"[{watched.slug}] [تشخيص نمط] اكتُشف نمط متسلسل: {detected_pattern[:80]} (الأصفار: {padding_width})")
 
-        t0 = time.monotonic()
         if detected_pattern:
             for tid in token_ids:
                 track = tracks_by_id[tid]
@@ -216,8 +229,7 @@ async def process_collection_async(watched_id: int):
                 chunk = token_ids[i:i + BATCH_SIZE]
                 try:
                     uri_results = await async_batch_get_token_uris(watched.contract_address, chunk, chain)
-                except Exception as e:
-                    log.error(f"[{watched.slug}] خطأ بجلب دفعة tokenURI: {e}")
+                except Exception:
                     continue
 
                 for token_id, uri in uri_results.items():
@@ -231,34 +243,26 @@ async def process_collection_async(watched_id: int):
 
         try:
             session.commit()
-        except Exception as e:
-            log.error(f"[{watched.slug}] فشل حفظ روابط tokenURI (تعارض توقيت محتمل): {e}")
+        except Exception:
             session.rollback()
 
         if not uris_to_fetch:
-            log.info(f"[{watched.slug}] [تشخيص] لا يوجد أي رابط جديد يحتاج فحص هذي الدورة.")
             return
 
         t0 = time.monotonic()
-        fetched_this_cycle = []
         metadata_map = await async_batch_resolve_metadata(uris_to_fetch)
         elapsed = round(time.monotonic() - t0, 3)
 
-        success_count = sum(1 for v in metadata_map.values() if v is not None)
-        log.info(f"[{watched.slug}] [تشخيص توقيت] جلب المحتوى الفعلي (IPFS/HTTP): "
-                  f"{elapsed} ثانية | نجح {success_count}/{len(uris_to_fetch)}.")
-
+        fetched_this_cycle = []
         for token_id, metadata in metadata_map.items():
             if metadata is not None:
                 track = tracks_by_id[token_id]
                 sig = content_signature(metadata)
                 fetched_this_cycle.append((track, metadata, sig))
-                COLLECTION_METADATA_CACHE[watched.id][token_id] = metadata
 
         try:
             session.commit()
-        except Exception as e:
-            log.error(f"[{watched.slug}] فشل حفظ الميتاداتا المجلوبة: {e}")
+        except Exception:
             session.rollback()
 
         if fetched_this_cycle:
@@ -272,50 +276,31 @@ async def process_collection_async(watched_id: int):
                 watched.baseline_locked = True
                 try:
                     session.commit()
-                except Exception as e:
-                    log.error(f"[{watched.slug}] فشل حفظ baseline: {e}")
+                except Exception:
                     session.rollback()
-                log.info(f"[{watched.slug}] 🔒 [تشخيص كشف] حُدّد الشكل الموحّد (baseline) من {len(signatures)} عيّنة.")
+                log.info(f"[{watched.slug}] 🔒 حُدّد الشكل الموحّد (baseline) من {len(signatures)} عيّنة.")
             elif len(signatures) >= 15:
                 watched.baseline_locked = True
                 watched.baseline_signature = None
                 try:
                     session.commit()
-                except Exception as e:
-                    log.error(f"[{watched.slug}] فشل حفظ حالة baseline: {e}")
+                except Exception:
                     session.rollback()
-                log.info(f"[{watched.slug}] 🔓 [تشخيص كشف] المجموعة منكشفة بالكامل (كل القطع فريدة، ولا baseline).")
+                log.info(f"[{watched.slug}] 🔓 المجموعة منكشفة بالكامل (جميع القطع فريدة).")
 
         changed_count = 0
-        conflict_count = 0
-        diag_samples = []
-
         for track, metadata, sig in fetched_this_cycle:
             was_revealed = track.revealed
             is_placeholder = is_placeholder_fallback(metadata)
 
             if watched.baseline_locked and watched.baseline_signature:
-                differs_from_baseline = sig != watched.baseline_signature
-                now_revealed = differs_from_baseline and not is_placeholder
-                method = "baseline+fallback"
-                if differs_from_baseline and is_placeholder:
-                    conflict_count += 1
-                    if conflict_count <= 5:
-                        log.warning(
-                            f"[{watched.slug}] ⚠️ [تعارض كشف] القطعة #{track.token_id}: "
-                            f"البصمة تختلف عن baseline (يفترض منكشفة) لكن "
-                            f"is_placeholder_fallback رفضها. الاسم: '{metadata.get('name','')}' | "
-                            f"عدد الصفات: {len(metadata.get('traits') or metadata.get('attributes') or [])}"
-                        )
+                now_revealed = (sig != watched.baseline_signature) and not is_placeholder
             else:
                 now_revealed = not is_placeholder
-                method = "fallback-only (لسا ما تحدد baseline)"
 
             track.revealed = now_revealed
             if now_revealed and not was_revealed:
                 changed_count += 1
-                if len(diag_samples) < 5:
-                    diag_samples.append(f"#{track.token_id}({method})")
 
             if now_revealed:
                 COLLECTION_METADATA_CACHE[watched.id][track.token_id] = metadata
@@ -324,42 +309,30 @@ async def process_collection_async(watched_id: int):
 
         try:
             session.commit()
-        except Exception as e:
-            log.error(f"[{watched.slug}] فشل حفظ حالة الانكشاف: {e}")
+        except Exception:
             session.rollback()
-
-        if changed_count:
-            log.info(f"[{watched.slug}] 🔔 [تشخيص كشف] {changed_count} قطعة انكشفت هذي الدورة. "
-                      f"أمثلة: {', '.join(diag_samples)}")
-        if conflict_count:
-            log.warning(f"[{watched.slug}] ⚠️ [تشخيص كشف] إجمالي {conflict_count} حالة تعارض "
-                        f"بين الإشارتين هذي الدورة (راجع التحذيرات فوق للتفاصيل).")
 
         cumulative_revealed_items = list(COLLECTION_METADATA_CACHE[watched.id].items())
         cumulative_count = len(cumulative_revealed_items)
 
-        ensure_collection_placeholder(session, watched, revealed_count=cumulative_count)
-
         from models import Collection
         existing_collection = session.query(Collection).filter_by(slug=watched.slug).first()
+        previous_count = existing_collection.revealed_count if existing_collection else 0
         has_rare_items = existing_collection and len(existing_collection.rare_items) > 0
 
-        if (changed_count > 0 or (cumulative_count > 0 and not has_rare_items)) and cumulative_revealed_items:
+        ensure_collection_placeholder(session, watched, revealed_count=cumulative_count)
+
+        if (cumulative_count > previous_count or not has_rare_items) and cumulative_revealed_items:
             t0 = time.monotonic()
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
-                log.info(f"[{watched.slug}] 🎯 [تشخيص توقيت] حساب الترتيب الكامل لـ "
-                          f"{result['revealed_total']} قطعة: {round(time.monotonic() - t0, 3)} ثانية.")
+                log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة على شبكة ({chain}) بالكامل!")
 
         total_cycle_time = round(time.monotonic() - cycle_start, 3)
         log.info(f"[{watched.slug}] ⏱️ [تشخيص] إجمالي وقت هذي الدورة كاملة: {total_cycle_time} ثانية.")
 
     except Exception as e:
-        log.error(f"[معالجة watched_id={watched_id}] خطأ غير متوقع: {e}")
-        try:
-            session.rollback()
-        except Exception:
-            pass
+        pass
     finally:
         try:
             session.close()
@@ -368,30 +341,17 @@ async def process_collection_async(watched_id: int):
 
 
 async def process_collection_with_timeout(watched_id: int):
-    session = SessionLocal()
-    max_sup = 10000
     try:
-        watched = session.query(WatchedCollection).filter_by(id=watched_id, active=True).first()
-        if watched and watched.max_supply:
-            max_sup = watched.max_supply
+        await asyncio.wait_for(process_collection_async(watched_id), timeout=30.0)
+    except asyncio.TimeoutError:
+        log.warning(f"[Timeout] فحص الكولكشن استغرق أكثر من 30 ثانية — للانتقال المباشر للدورة التالية.")
     except Exception:
         pass
-    finally:
-        session.close()
-
-    dynamic_timeout = max(35.0, float(max_sup / 1000.0) * 10.0)
-
-    try:
-        await asyncio.wait_for(process_collection_async(watched_id), timeout=dynamic_timeout)
-    except asyncio.TimeoutError:
-        log.warning(f"[watched_id={watched_id}] [Timeout] فحص الكولكشن استغرق أكثر من {dynamic_timeout} ثانية — للانتقال للدورة التالية.")
-    except Exception as e:
-        log.error(f"[watched_id={watched_id}] خطأ غير متوقع بمهمة المعالجة: {e}")
 
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف السريع اللحظي المباشر.")
+    log.info("🚀 بدأ محرك المراقبة الجارف المباشر (On-Chain maxSupply Priority + 0-Indexed Support).")
 
     while True:
         try:
