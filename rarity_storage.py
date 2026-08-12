@@ -1,5 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد مع حساب N_total الكلي وNull Traits.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد (Pure Universal OpenRarity Engine).
+تعتمد على الرياضيات البحتة وانتروبيا عدد الخصائص (Trait Count Entropy) للتعامل مع كافة أنواع المجموعات والقطع الفريدة بدون كلمات مفتاحية هشة.
 """
 
 import hashlib
@@ -18,6 +19,7 @@ PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
 
 
 def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
+    """تحديد الفئة بناءً على الموقع الحقيقي في المصفوفة المرتبة (Index Percentile Cap)."""
     if not total or total <= 0:
         total = 1000
 
@@ -31,7 +33,7 @@ def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
 
 
 def extract_traits_generic(metadata: dict) -> list:
-    """استخراج الخصائص الشامل مرن ومحمي 100% لكل الهياكل."""
+    """استخراج الخصائص بمرونة شاملة لجميع هياكل الـ JSON."""
     if not isinstance(metadata, dict):
         return []
 
@@ -86,63 +88,50 @@ def extract_opensea_official_rank(metadata: dict) -> int | None:
     return None
 
 
-def build_trait_frequency_with_count(nfts: list[dict]) -> tuple[dict, set]:
-    """حساب تكرار الخصائص وجميع أنواع الفئات المتاحة للكولكشن."""
+def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
+    """حساب تكرار كل قيمة + تكرار عدد الخصائص الإجمالي (Trait Count)."""
     freq = {}
-    all_categories = set()
-
     for nft in nfts:
         traits = nft.get("traits") or []
         trait_count_str = str(len(traits))
         freq.setdefault("Trait Count", {})
         freq["Trait Count"][trait_count_str] = freq["Trait Count"].get(trait_count_str, 0) + 1
-        all_categories.add("Trait Count")
 
         for trait in traits:
             t_type = trait.get("trait_type")
             t_value = trait.get("value")
             if not t_type or not t_value:
                 continue
-            all_categories.add(t_type)
             freq.setdefault(t_type, {})
             freq[t_type][t_value] = freq[t_type].get(t_value, 0) + 1
+    return freq
 
-    return freq, all_categories
 
-
-def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, all_categories: set, total: int) -> list[dict]:
+def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
     """
-    حساب نقاط الندرة بمعيار OpenRarity الرسمي الصريح:
-    1. حساب الانتروبيا بناءً على N_total الكلي للمجموعة.
-    2. حساب انتروبيا الخصائص المفقودة (Null Traits Entropy).
-    3. دقة 8 خانات عشرية مع كسر التعادل الحتمي.
+    حساب نقاط الانتروبيا اللوغاريتمية الرياضية البحتة (Universal Pure OpenRarity):
+    تعتمد على رياضيات تكرار الخصائص وعدد الصفات (Trait Count Entropy) دون الحاجة لكلمات مفتاحية هشة.
     """
     results = []
 
     for nft in nfts:
         traits = nft.get("traits") or []
-        nft_traits_dict = {t["trait_type"]: t["value"] for t in traits if isinstance(t, dict) and "trait_type" in t and "value" in t}
         score = 0.0
 
-        # 1. نقاط عدد الخصائص (Trait Count Log Rarity)
+        # 1. نقاط انتروبيا عدد الخصائص (Trait Count Entropy)
+        # تعطي التوكينات عديمة الصفات أو قليلة الصفات استحقاقها الرياضي الطبيعي إذا كانت نادرة
         t_count_str = str(len(traits))
         count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
         score += math.log2(total / max(count_tc, 1))
 
-        # 2. نقاط فئات الخصائص الموجودة والمفقودة (OpenRarity Full Category Entropy)
-        for cat in all_categories:
-            if cat == "Trait Count":
+        # 2. نقاط انتروبيا الخصائص المباشرة (Individual Traits Entropy)
+        for trait in traits:
+            t_type = trait.get("trait_type")
+            t_value = trait.get("value")
+            if not t_type or not t_value:
                 continue
-
-            if cat in nft_traits_dict:
-                val = nft_traits_dict[cat]
-                count = freq.get(cat, {}).get(val, 1)
-                score += math.log2(total / max(count, 1))
-            else:
-                # 🎯 حساب الانتروبيا للخصائص المفقودة (Null Trait Entropy)
-                present_count = sum(freq.get(cat, {}).values())
-                null_count = max(total - present_count, 1)
-                score += math.log2(total / null_count)
+            count = freq.get(t_type, {}).get(t_value, 1)
+            score += math.log2(total / max(count, 1))
 
         try:
             tid_num = int(nft.get("identifier", 0))
@@ -158,7 +147,7 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, all_categories:
             "rarity_score": round(score, 8),
         })
 
-    # فرز تنازلي حسب النقاط، ثم حسب رقم التوكين تصاعدياً لكسر التعادل
+    # فرز تنازلي حسب السكور، مع كسر التعادل برقم التوكين تصاعدياً لضمان الفرز الحتمي
     results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
 
     for i, item in enumerate(results):
@@ -243,13 +232,11 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
 
     pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
     revealed_total = len(pseudo_nfts)
-    
-    # 🎯 تصحيح جوهري: الاعتماد على الإجمالي الكلي للمجموعة N_total
     total_supply = watched.max_supply or revealed_total
 
-    freq, all_categories = build_trait_frequency_with_count(pseudo_nfts)
-    # 🎯 تمرير total_supply الإجمالي لحساب النسبة الدقيقة
-    ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, all_categories, total=total_supply)
+    # الاعتماد الحصري النظيف على حسابنا اللوغاريتمي الداخلي بدون خلط ولا افتراضات هشة
+    freq = build_trait_frequency_with_count(pseudo_nfts)
+    ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, total=revealed_total)
 
     try:
         from rarity_core import fetch_best_listings
