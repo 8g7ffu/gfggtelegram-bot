@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 from models import Collection, RareItem
 from price_utils import get_eth_usd_rate
+from rarity_core import listing_price_to_eth_usd
 
 ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
@@ -264,11 +265,13 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
         if tier is None:
             continue
 
-        price_eth = price_map_eth.get(str(item["identifier"])) if isinstance(price_map_eth, dict) else None
+        listing_price = price_map_eth.get(str(item["identifier"])) if isinstance(price_map_eth, dict) else None
+        # نحوّل حسب عملة العرض الفعلية: نضرب بسعر الصرف فقط لو كانت إيثيريوم/WETH،
+        # أما العروض المسعّرة أصلاً بعملة مستقرة بالدولار (USDC وغيرها) فلا تُضرب إطلاقاً
+        price_eth, price_usd = listing_price_to_eth_usd(listing_price, eth_usd_rate)
         if price_eth and price_eth > 500:
             price_eth = None
-
-        price_usd = (price_eth * eth_usd_rate) if (price_eth is not None and eth_usd_rate) else None
+            price_usd = None
 
         session.add(RareItem(
             collection_id=collection.id,
