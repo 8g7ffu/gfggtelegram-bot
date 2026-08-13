@@ -3,15 +3,16 @@
 وجمع البيانات الكاملة للمجموعة قبل تشغيل محرك Rarity.
 
 المسؤوليات:
-1) تحديد Max Supply من البلوكشين أولاً.
-2) إنشاء/توسيع سجلات تتبع كل Token.
-3) مراقبة tokenURI مباشرة.
-4) دعم data:, IPFS, HTTP/HTTPS.
-5) استخدام Base URI inference فقط عندما يكون النمط قابلاً للاختبار.
-6) جلب Metadata مباشرة وعدم الاعتماد على OpenSea لإثبات الـReveal.
-7) تحديد Placeholder مقابل Revealed.
-8) حفظ جميع الـRevealed Metadata تراكميًا.
-9) تشغيل rarity_storage فقط عندما تصبح البيانات كاملة.
+1) تحديد Max Supply من المصادر المناسبة.
+2) فصل Max Supply عن Total Supply.
+3) إنشاء/توسيع سجلات تتبع Tokens.
+4) مراقبة tokenURI مباشرة.
+5) دعم data:, IPFS, HTTP/HTTPS.
+6) استخدام Base URI inference فقط عندما يكون النمط قابلاً للاختبار.
+7) جلب Metadata مباشرة وعدم الاعتماد على OpenSea لإثبات الـReveal.
+8) تحديد Placeholder مقابل Revealed.
+9) حفظ جميع الـRevealed Metadata تراكميًا.
+10) تشغيل rarity_storage عند وجود بيانات جديدة أو عدم وجود نتائج سابقة.
 """
 
 import asyncio
@@ -66,22 +67,24 @@ log = logging.getLogger("reveal-watcher")
 # ============================================================
 
 POLL_INTERVAL = 2
+
 BATCH_SIZE = 500
+
 DEFAULT_START_TOKEN_ID = 1
 
-# عدد العينات التي نستخدمها لاختبار URI pattern
 PATTERN_VALIDATION_SAMPLE_SIZE = 12
 
-# ذاكرة Metadata المكتشفة.
 # watched_id -> {token_id: metadata}
 COLLECTION_METADATA_CACHE = {}
 
-# ذاكرة الـURI الحقيقية التي أرجعها العقد.
 # watched_id -> {token_id: uri}
 COLLECTION_URI_CACHE = {}
 
-# نحتفظ بآخر حالة baseline لكل Collection
+# watched_id -> [baseline signatures]
 BASELINE_SAMPLE_CACHE = {}
+
+# watched_id -> last known totalSupply
+COLLECTION_TOTAL_SUPPLY_CACHE = {}
 
 
 # ============================================================
@@ -89,6 +92,7 @@ BASELINE_SAMPLE_CACHE = {}
 # ============================================================
 
 def is_dynamic_url(uri: str) -> bool:
+
     if not uri:
         return False
 
@@ -101,6 +105,7 @@ def is_dynamic_url(uri: str) -> bool:
 
 
 def is_data_uri(uri: str) -> bool:
+
     if not uri:
         return False
 
@@ -108,6 +113,7 @@ def is_data_uri(uri: str) -> bool:
 
 
 def normalize_uri(uri: str | None) -> str:
+
     if uri is None:
         return ""
 
@@ -115,7 +121,81 @@ def normalize_uri(uri: str | None) -> str:
 
 
 # ============================================================
-# Supply resolver
+# On-chain Total Supply
+# ============================================================
+
+def resolve_total_supply(
+    watched: WatchedCollection,
+) -> int | None:
+
+    """
+    يقرأ totalSupply() مباشرة من العقد.
+
+    مهم:
+    totalSupply != maxSupply
+
+    totalSupply:
+        عدد الـNFTs الموجودة/المصكوكة حاليًا.
+
+    maxSupply:
+        الحد الأقصى النهائي للمجموعة.
+
+    لا نستخدم totalSupply لتغيير watched.max_supply.
+    """
+
+    chain = watched.chain or "ethereum"
+
+    selector = bytes.fromhex(
+        "18160ddd"
+    )
+
+    try:
+
+        w3 = get_web3(chain)
+
+        checksum_addr = (
+            Web3.to_checksum_address(
+                watched.contract_address
+            )
+        )
+
+        result = w3.eth.call(
+            {
+                "to": checksum_addr,
+                "data": selector,
+            }
+        )
+
+        if not result:
+            return None
+
+        if len(result) != 32:
+            return None
+
+        (
+            total_supply,
+        ) = eth_abi_decode(
+            ["uint256"],
+            result,
+        )
+
+        if (
+            total_supply is not None
+            and int(total_supply) >= 0
+        ):
+
+            return int(
+                total_supply
+            )
+
+    except Exception:
+        pass
+
+    return None
+
+
+# ============================================================
+# Max Supply Resolver
 # ============================================================
 
 def resolve_max_supply(
@@ -123,26 +203,48 @@ def resolve_max_supply(
 ) -> int:
 
     """
-    محاولة الحصول على Supply الحقيقي من العقد أولاً.
+    محاولة الحصول على Max Supply الحقيقي.
 
-    لا نعتمد على OpenSea كمصدر أول.
+    لا نستخدم totalSupply() هنا.
+
+    الأولوية:
+
+    1. maxSupply()
+    2. MAX_SUPPLY()
+    3. maxTokens()
+    4. OpenSea collection
+    5. OpenSea drop
+    6. القيمة المخزنة مسبقًا
     """
 
     chain = watched.chain or "ethereum"
 
     selectors = [
-        bytes.fromhex("18160ddd"),  # totalSupply()
-        bytes.fromhex("d5abeb01"),  # maxSupply()
-        bytes.fromhex("d368b122"),  # MAX_SUPPLY()
-        bytes.fromhex("3a4b66f1"),  # maxTokens()
+
+        # maxSupply()
+        bytes.fromhex(
+            "d5abeb01"
+        ),
+
+        # MAX_SUPPLY()
+        bytes.fromhex(
+            "d368b122"
+        ),
+
+        # maxTokens()
+        bytes.fromhex(
+            "3a4b66f1"
+        ),
     ]
 
     try:
 
         w3 = get_web3(chain)
 
-        checksum_addr = Web3.to_checksum_address(
-            watched.contract_address
+        checksum_addr = (
+            Web3.to_checksum_address(
+                watched.contract_address
+            )
         )
 
         for selector in selectors:
@@ -163,20 +265,18 @@ def resolve_max_supply(
                     continue
 
                 (
-                    on_chain_supply,
+                    value,
                 ) = eth_abi_decode(
                     ["uint256"],
                     result,
                 )
 
                 if (
-                    on_chain_supply
-                    and on_chain_supply > 0
+                    value
+                    and int(value) > 0
                 ):
 
-                    return int(
-                        on_chain_supply
-                    )
+                    return int(value)
 
             except Exception:
                 continue
@@ -184,18 +284,27 @@ def resolve_max_supply(
     except Exception:
         pass
 
-    # Fallback إلى OpenSea / Drops فقط عند فشل on-chain.
+    # --------------------------------------------------------
+    # OpenSea fallback
+    # --------------------------------------------------------
+
     try:
 
         supply = fetch_max_supply(
             watched.slug
         )
 
-        if supply and supply > 0:
+        if (
+            supply
+            and supply > 0
+        ):
+
             return int(supply)
 
-        drop_status = fetch_drop_status(
-            watched.slug
+        drop_status = (
+            fetch_drop_status(
+                watched.slug
+            )
         )
 
         if drop_status:
@@ -205,13 +314,17 @@ def resolve_max_supply(
                 "total_supply",
             ):
 
-                value = drop_status.get(
-                    key
+                value = (
+                    drop_status.get(
+                        key
+                    )
                 )
 
                 if value:
 
-                    value = int(value)
+                    value = int(
+                        value
+                    )
 
                     if value > 0:
                         return value
@@ -219,8 +332,20 @@ def resolve_max_supply(
     except Exception:
         pass
 
-    # آخر fallback فقط.
-    return watched.max_supply or 10000
+    # --------------------------------------------------------
+    # Existing stored value
+    # --------------------------------------------------------
+
+    if (
+        watched.max_supply
+        and watched.max_supply > 0
+    ):
+
+        return int(
+            watched.max_supply
+        )
+
+    return 10000
 
 
 # ============================================================
@@ -232,20 +357,30 @@ def ensure_tracks(
     watched: WatchedCollection,
 ) -> bool:
 
-    latest_supply = resolve_max_supply(
-        watched
+    latest_max_supply = (
+        resolve_max_supply(
+            watched
+        )
     )
+
+    # --------------------------------------------------------
+    # لا ننقص max_supply بسبب totalSupply
+    # --------------------------------------------------------
 
     if (
         not watched.max_supply
-        or latest_supply > watched.max_supply
+        or latest_max_supply
+        > watched.max_supply
     ):
 
         old_supply = (
-            watched.max_supply or 0
+            watched.max_supply
+            or 0
         )
 
-        watched.max_supply = latest_supply
+        watched.max_supply = (
+            latest_max_supply
+        )
 
         watched.failed_attempts = 0
 
@@ -255,17 +390,17 @@ def ensure_tracks(
 
             log.info(
                 f"[{watched.slug}] "
-                f"تحديث Supply: "
+                f"تحديث Max Supply: "
                 f"{old_supply} -> "
-                f"{latest_supply}"
+                f"{latest_max_supply}"
             )
 
         else:
 
             log.info(
                 f"[{watched.slug}] "
-                f"Supply المحدد: "
-                f"{latest_supply}"
+                f"Max Supply: "
+                f"{latest_max_supply}"
             )
 
         ensure_collection_placeholder(
@@ -274,20 +409,37 @@ def ensure_tracks(
             revealed_count=0,
         )
 
-    existing_count = (
-        session.query(RevealTrack)
-        .filter_by(
-            watched_id=watched.id
+    # --------------------------------------------------------
+    # Total Supply الحالي
+    # --------------------------------------------------------
+
+    total_supply = (
+        resolve_total_supply(
+            watched
         )
-        .count()
     )
 
     if (
-        existing_count
-        >= watched.max_supply
+        total_supply is not None
     ):
 
-        return True
+        COLLECTION_TOTAL_SUPPLY_CACHE[
+            watched.id
+        ] = total_supply
+
+        log.info(
+            f"[{watched.slug}] "
+            f"On-chain Total Supply="
+            f"{total_supply} | "
+            f"Max Supply="
+            f"{watched.max_supply}"
+        )
+
+    # --------------------------------------------------------
+    # إنشاء Tracks حتى Max Supply
+    #
+    # لا نحذف الموجود.
+    # --------------------------------------------------------
 
     existing_ids = {
         row.token_id
@@ -302,6 +454,17 @@ def ensure_tracks(
         )
     }
 
+    existing_count = len(
+        existing_ids
+    )
+
+    if (
+        existing_count
+        >= watched.max_supply
+    ):
+
+        return True
+
     new_tracks = []
 
     end_token_id = (
@@ -314,7 +477,10 @@ def ensure_tracks(
         end_token_id,
     ):
 
-        if token_id not in existing_ids:
+        if (
+            token_id
+            not in existing_ids
+        ):
 
             new_tracks.append(
                 RevealTrack(
@@ -333,9 +499,9 @@ def ensure_tracks(
 
         log.info(
             f"[{watched.slug}] "
-            f"تم إنشاء/توسيع "
+            f"تم إنشاء "
             f"{len(new_tracks)} "
-            f"سجل Token."
+            f"سجل Token جديد."
         )
 
     return True
@@ -350,11 +516,16 @@ def check_global_flag(
     watched: WatchedCollection,
 ):
 
-    chain = watched.chain or "ethereum"
+    chain = (
+        watched.chain
+        or "ethereum"
+    )
 
-    flag = detect_global_reveal_flag(
-        watched.contract_address,
-        chain=chain,
+    flag = (
+        detect_global_reveal_flag(
+            watched.contract_address,
+            chain=chain,
+        )
     )
 
     if (
@@ -362,7 +533,9 @@ def check_global_flag(
         != watched.global_revealed_flag
     ):
 
-        watched.global_revealed_flag = flag
+        watched.global_revealed_flag = (
+            flag
+        )
 
         session.commit()
 
@@ -376,59 +549,59 @@ def check_global_flag(
 
 
 # ============================================================
-# Base URI pattern inference
+# Base URI Pattern Detection
 # ============================================================
 
 def detect_base_uri_pattern_smart(
     sample_uris: dict[int, str],
 ) -> tuple[str | None, int]:
 
-    """
-    استنتاج نمط URI فقط كمرشح.
-
-    لا نعتمد على أول URI فقط.
-
-    هذه الدالة:
-    - ترفض data:
-    - تحاول اكتشاف zero-padding
-    - تحاول اكتشاف {id}
-    - لا تعتبر النمط صحيحًا بشكل نهائي
-      إلا بعد أن يقوم المستدعي باختباره.
-    """
-
     valid_uris = {
-        int(token_id): normalize_uri(uri)
-        for token_id, uri in sample_uris.items()
+
+        int(token_id): normalize_uri(
+            uri
+        )
+
+        for token_id, uri
+        in (
+            sample_uris or {}
+        ).items()
+
         if normalize_uri(uri)
     }
 
     if not valid_uris:
         return None, 0
 
-    # data URI لا تستعمل pattern inference.
     if any(
         is_data_uri(uri)
         for uri in valid_uris.values()
     ):
+
         return None, 0
 
-    # إذا كل الروابط متطابقة،
-    # غالبًا هو placeholder URI موحد.
     if (
-        len(set(valid_uris.values()))
+        len(
+            set(
+                valid_uris.values()
+            )
+        )
         == 1
         and len(valid_uris) > 1
     ):
+
         return None, 0
 
     candidates = []
 
-    for token_id, uri in valid_uris.items():
+    for token_id, uri in (
+        valid_uris.items()
+    ):
 
-        token_str = str(token_id)
+        token_str = str(
+            token_id
+        )
 
-        # الحالة المعتادة:
-        # .../000123.json
         match = re.search(
             r"(0*)"
             + re.escape(token_str)
@@ -438,9 +611,13 @@ def detect_base_uri_pattern_smart(
 
         if match:
 
-            zeros = match.group(1)
+            zeros = (
+                match.group(1)
+            )
+
             extension = (
-                match.group(2) or ""
+                match.group(2)
+                or ""
             )
 
             padding_width = (
@@ -474,7 +651,6 @@ def detect_base_uri_pattern_smart(
 
             continue
 
-        # حالة URI تحتوي token id داخل المسار.
         if token_str in uri:
 
             prefix, suffix = (
@@ -500,10 +676,10 @@ def detect_base_uri_pattern_smart(
     if not candidates:
         return None, 0
 
-    # اختيار أكثر pattern تكرارًا.
     counter = {}
 
     for candidate in candidates:
+
         counter[candidate] = (
             counter.get(
                 candidate,
@@ -521,7 +697,7 @@ def detect_base_uri_pattern_smart(
 
 
 # ============================================================
-# Validate inferred URI pattern
+# Validate URI Pattern
 # ============================================================
 
 async def validate_uri_pattern(
@@ -533,20 +709,14 @@ async def validate_uri_pattern(
     chain: str,
 ) -> bool:
 
-    """
-    لا نثق في URI inference حتى نختبره مقابل
-    tokenURI الحقيقي للعقد.
-
-    أي mismatch مهم = رفض pattern.
-    """
-
     if not pattern:
         return False
 
     if not sample_ids:
         return False
 
-    expected_ids = []
+    checked = 0
+    matches = 0
 
     for token_id in sample_ids:
 
@@ -558,26 +728,18 @@ async def validate_uri_pattern(
             else str(token_id)
         )
 
-        expected_uri = pattern.replace(
-            "{id}",
-            formatted,
-        )
-
-        expected_ids.append(
-            (
-                token_id,
-                expected_uri,
+        expected_uri = (
+            pattern.replace(
+                "{id}",
+                formatted,
             )
         )
 
-    # قارن فقط بالروابط الفعلية التي لدينا.
-    checked = 0
-    matches = 0
-
-    for token_id, expected_uri in expected_ids:
-
         actual_uri = normalize_uri(
-            actual_sample_uris.get(
+            (
+                actual_sample_uris
+                or {}
+            ).get(
                 token_id
             )
         )
@@ -588,13 +750,12 @@ async def validate_uri_pattern(
         checked += 1
 
         if (
-            expected_uri
-            == actual_uri
+            actual_uri
+            == expected_uri
         ):
 
             matches += 1
 
-    # يجب أن تكون جميع العينات الصالحة مطابقة.
     return (
         checked >= 3
         and matches == checked
@@ -611,7 +772,9 @@ async def process_collection_async(
 
     session = SessionLocal()
 
-    cycle_start = time.monotonic()
+    cycle_start = (
+        time.monotonic()
+    )
 
     try:
 
@@ -629,9 +792,9 @@ async def process_collection_async(
         if not watched:
             return
 
-        # -----------------------------------------
-        # 1. Supply + tracks
-        # -----------------------------------------
+        # ====================================================
+        # 1. Supply + Tracks
+        # ====================================================
 
         ok = ensure_tracks(
             session,
@@ -646,17 +809,15 @@ async def process_collection_async(
             or "ethereum"
         )
 
-        # -----------------------------------------
-        # 2. On-chain reveal flag
-        # -----------------------------------------
+        # ====================================================
+        # 2. Global Reveal Flag
+        # ====================================================
 
         check_global_flag(
             session,
             watched,
         )
 
-        # إذا كان العقد يقول صراحة إن الـreveal
-        # لم يبدأ، لا نهدر طلبات metadata.
         if (
             watched.global_revealed_flag
             is False
@@ -670,9 +831,9 @@ async def process_collection_async(
 
             return
 
-        # -----------------------------------------
-        # 3. Initialize caches
-        # -----------------------------------------
+        # ====================================================
+        # 3. Initialize Caches
+        # ====================================================
 
         if (
             watched.id
@@ -701,9 +862,9 @@ async def process_collection_async(
                 watched.id
             ] = []
 
-        # -----------------------------------------
-        # 4. Load tracks
-        # -----------------------------------------
+        # ====================================================
+        # 4. Load Tracks
+        # ====================================================
 
         tracks = (
             session.query(
@@ -728,9 +889,32 @@ async def process_collection_async(
             for track in tracks
         }
 
-        # -----------------------------------------
-        # 5. Obtain real tokenURI samples
-        # -----------------------------------------
+        # ====================================================
+        # 5. Real Total Supply
+        # ====================================================
+
+        current_total_supply = (
+            COLLECTION_TOTAL_SUPPLY_CACHE.get(
+                watched.id
+            )
+        )
+
+        if (
+            current_total_supply is not None
+            and current_total_supply > 0
+        ):
+
+            log.info(
+                f"[{watched.slug}] "
+                f"Minted/Existing="
+                f"{current_total_supply} | "
+                f"Max="
+                f"{watched.max_supply}"
+            )
+
+        # ====================================================
+        # 6. URI Samples
+        # ====================================================
 
         sample_ids = [
             token_id
@@ -763,7 +947,6 @@ async def process_collection_async(
             )
         )
 
-        # Save actual sample URI state.
         for token_id, uri in (
             sample_uris or {}
         ).items():
@@ -772,13 +955,13 @@ async def process_collection_async(
 
                 COLLECTION_URI_CACHE[
                     watched.id
-                ][token_id] = normalize_uri(
-                    uri
+                ][token_id] = (
+                    normalize_uri(uri)
                 )
 
-        # -----------------------------------------
-        # 6. Detect candidate URI pattern
-        # -----------------------------------------
+        # ====================================================
+        # 7. URI Pattern
+        # ====================================================
 
         (
             detected_pattern,
@@ -791,18 +974,13 @@ async def process_collection_async(
 
         if detected_pattern:
 
-            # Validate using actual tokenURI calls.
             validation_ids = list(
                 dict.fromkeys(
                     sample_ids
                 )
             )
 
-            # Add additional distant IDs
-            # where possible.
-            for candidate in (
-                token_ids
-            ):
+            for candidate in token_ids:
 
                 if (
                     candidate
@@ -834,9 +1012,9 @@ async def process_collection_async(
                 )
             )
 
-        # -----------------------------------------
-        # 7. Fetch URIs
-        # -----------------------------------------
+        # ====================================================
+        # 8. Fetch URIs
+        # ====================================================
 
         uris_to_fetch = {}
 
@@ -878,16 +1056,11 @@ async def process_collection_async(
                     )
                 )
 
-                # Data URI أو URI ديناميكي لا نولدها من pattern.
-                if (
-                    is_data_uri(
-                        computed_uri
-                    )
-                    or is_dynamic_url(
-                        computed_uri
-                    )
-                ):
-                    pass
+                # ------------------------------------------------
+                # مهم:
+                # لا نستخدم URI المولد كدليل Reveal.
+                # نستخدمه فقط لتحديد مكان Metadata.
+                # ------------------------------------------------
 
                 if (
                     not track.revealed
@@ -908,12 +1081,6 @@ async def process_collection_async(
                     ] = computed_uri
 
         else:
-
-            # -------------------------------------
-            # IMPORTANT:
-            # إذا فشل pattern inference،
-            # نستخدم tokenURI الحقيقي لكل token.
-            # -------------------------------------
 
             log.info(
                 f"[{watched.slug}] "
@@ -942,7 +1109,14 @@ async def process_collection_async(
                         )
                     )
 
-                except Exception:
+                except Exception as exc:
+
+                    log.warning(
+                        f"[{watched.slug}] "
+                        f"فشل جلب URI batch: "
+                        f"{exc}"
+                    )
+
                     continue
 
                 for token_id, uri in (
@@ -961,10 +1135,13 @@ async def process_collection_async(
                     ][token_id] = uri
 
                     track = (
-                        tracks_by_id[
+                        tracks_by_id.get(
                             token_id
-                        ]
+                        )
                     )
+
+                    if not track:
+                        continue
 
                     if (
                         not track.revealed
@@ -972,7 +1149,9 @@ async def process_collection_async(
                         != uri
                     ):
 
-                        track.last_uri = uri
+                        track.last_uri = (
+                            uri
+                        )
 
                         track.content_checked_at = (
                             now
@@ -983,238 +1162,252 @@ async def process_collection_async(
                         ] = uri
 
         try:
+
             session.commit()
+
         except Exception:
+
             session.rollback()
 
-        # -----------------------------------------
-        # 8. Nothing changed
-        # -----------------------------------------
+        # ====================================================
+        # 9. Nothing Changed
+        # ====================================================
 
         if not uris_to_fetch:
-            return
 
-        # -----------------------------------------
-        # 9. Resolve metadata
-        # -----------------------------------------
-
-        t0 = time.monotonic()
-
-        metadata_map = (
-            await async_batch_resolve_metadata(
-                uris_to_fetch
-            )
-        )
-
-        elapsed = round(
-            time.monotonic()
-            - t0,
-            3,
-        )
-
-        fetched_this_cycle = []
-
-        for (
-            token_id,
-            metadata,
-        ) in (
-            metadata_map or {}
-        ).items():
-
-            if metadata is None:
-                continue
-
-            track = tracks_by_id.get(
-                token_id
+            # حتى لو لم توجد Metadata جديدة،
+            # لا نخرج قبل التأكد من وجود نتائج rarity.
+            #
+            # هذا مهم عند إعادة تشغيل البوت.
+            metadata_cache = (
+                COLLECTION_METADATA_CACHE[
+                    watched.id
+                ]
             )
 
-            if not track:
-                continue
+            if not metadata_cache:
+                return
 
-            try:
+            cumulative_revealed_items = list(
+                metadata_cache.items()
+            )
 
-                signature = (
-                    content_signature(
+        else:
+
+            # =================================================
+            # 10. Resolve Metadata
+            # =================================================
+
+            t0 = time.monotonic()
+
+            metadata_map = (
+                await async_batch_resolve_metadata(
+                    uris_to_fetch
+                )
+            )
+
+            elapsed = round(
+                time.monotonic()
+                - t0,
+                3,
+            )
+
+            fetched_this_cycle = []
+
+            for (
+                token_id,
+                metadata,
+            ) in (
+                metadata_map or {}
+            ).items():
+
+                if metadata is None:
+                    continue
+
+                track = (
+                    tracks_by_id.get(
+                        token_id
+                    )
+                )
+
+                if not track:
+                    continue
+
+                try:
+
+                    signature = (
+                        content_signature(
+                            metadata
+                        )
+                    )
+
+                except Exception:
+
+                    continue
+
+                fetched_this_cycle.append(
+                    (
+                        track,
+                        metadata,
+                        signature,
+                    )
+                )
+
+            if fetched_this_cycle:
+
+                log.info(
+                    f"[{watched.slug}] "
+                    f"جلب Metadata لـ "
+                    f"{len(fetched_this_cycle)} "
+                    f"Token خلال "
+                    f"{elapsed}s."
+                )
+
+            # =================================================
+            # 11. Baseline Learning
+            # =================================================
+
+            baseline_samples = (
+                BASELINE_SAMPLE_CACHE[
+                    watched.id
+                ]
+            )
+
+            for (
+                _track,
+                _metadata,
+                signature,
+            ) in fetched_this_cycle:
+
+                baseline_samples.append(
+                    signature
+                )
+
+            if len(
+                baseline_samples
+            ) > 5000:
+
+                del baseline_samples[
+                    :-5000
+                ]
+
+            if (
+                not watched.baseline_locked
+                and len(
+                    baseline_samples
+                ) >= 15
+            ):
+
+                baseline = (
+                    compute_baseline_signature(
+                        baseline_samples
+                    )
+                )
+
+                if baseline:
+
+                    watched.baseline_signature = (
+                        baseline
+                    )
+
+                    watched.baseline_locked = (
+                        True
+                    )
+
+                    log.info(
+                        f"[{watched.slug}] "
+                        f"تم تثبيت Baseline."
+                    )
+
+                    try:
+                        session.commit()
+                    except Exception:
+                        session.rollback()
+
+            # =================================================
+            # 12. Determine Reveal State
+            # =================================================
+
+            changed_count = 0
+
+            metadata_cache = (
+                COLLECTION_METADATA_CACHE[
+                    watched.id
+                ]
+            )
+
+            for (
+                track,
+                metadata,
+                signature,
+            ) in fetched_this_cycle:
+
+                was_revealed = bool(
+                    track.revealed
+                )
+
+                is_placeholder = (
+                    is_placeholder_fallback(
                         metadata
                     )
                 )
 
+                if (
+                    watched.baseline_locked
+                    and watched.baseline_signature
+                ):
+
+                    now_revealed = (
+                        signature
+                        != watched.baseline_signature
+                        and not is_placeholder
+                    )
+
+                else:
+
+                    now_revealed = (
+                        not is_placeholder
+                    )
+
+                track.revealed = (
+                    now_revealed
+                )
+
+                if (
+                    now_revealed
+                    and not was_revealed
+                ):
+
+                    changed_count += 1
+
+                if now_revealed:
+
+                    metadata_cache[
+                        track.token_id
+                    ] = metadata
+
+                else:
+
+                    metadata_cache.pop(
+                        track.token_id,
+                        None,
+                    )
+
+            try:
+
+                session.commit()
+
             except Exception:
 
-                continue
+                session.rollback()
 
-            fetched_this_cycle.append(
-                (
-                    track,
-                    metadata,
-                    signature,
-                )
+            cumulative_revealed_items = list(
+                metadata_cache.items()
             )
 
-        try:
-            session.commit()
-        except Exception:
-            session.rollback()
-
-        if fetched_this_cycle:
-
-            log.info(
-                f"[{watched.slug}] "
-                f"جلب Metadata لـ "
-                f"{len(fetched_this_cycle)} "
-                f"Token خلال {elapsed}s."
-            )
-
-        # -----------------------------------------
-        # 10. Baseline learning
-        # -----------------------------------------
-
-        baseline_samples = (
-            BASELINE_SAMPLE_CACHE[
-                watched.id
-            ]
-        )
-
-        for (
-            _track,
-            _metadata,
-            signature,
-        ) in fetched_this_cycle:
-
-            baseline_samples.append(
-                signature
-            )
-
-        # منع نمو الذاكرة بلا حدود.
-        if len(
-            baseline_samples
-        ) > 5000:
-
-            del baseline_samples[
-                :-5000
-            ]
-
-        baseline = None
-
-        if (
-            not watched.baseline_locked
-            and len(
-                baseline_samples
-            ) >= 15
-        ):
-
-            baseline = (
-                compute_baseline_signature(
-                    baseline_samples
-                )
-            )
-
-            if baseline:
-
-                watched.baseline_signature = (
-                    baseline
-                )
-
-                watched.baseline_locked = (
-                    True
-                )
-
-                log.info(
-                    f"[{watched.slug}] "
-                    f"تم تثبيت Baseline "
-                    f"من عينة تراكمية."
-                )
-
-                try:
-                    session.commit()
-                except Exception:
-                    session.rollback()
-
-        # -----------------------------------------
-        # 11. Determine Reveal state
-        # -----------------------------------------
-
-        changed_count = 0
-
-        metadata_cache = (
-            COLLECTION_METADATA_CACHE[
-                watched.id
-            ]
-        )
-
-        for (
-            track,
-            metadata,
-            signature,
-        ) in fetched_this_cycle:
-
-            was_revealed = (
-                bool(track.revealed)
-            )
-
-            is_placeholder = (
-                is_placeholder_fallback(
-                    metadata
-                )
-            )
-
-            if (
-                watched.baseline_locked
-                and watched.baseline_signature
-            ):
-
-                # Placeholder baseline:
-                # نفس signature = Placeholder
-                now_revealed = (
-                    signature
-                    != watched.baseline_signature
-                    and not is_placeholder
-                )
-
-            else:
-
-                # في غياب baseline موثوق،
-                # نعتمد فقط على validity الأساسية للـmetadata.
-                now_revealed = (
-                    not is_placeholder
-                )
-
-            track.revealed = (
-                now_revealed
-            )
-
-            if (
-                now_revealed
-                and not was_revealed
-            ):
-
-                changed_count += 1
-
-            if now_revealed:
-
-                metadata_cache[
-                    track.token_id
-                ] = metadata
-
-            else:
-
-                metadata_cache.pop(
-                    track.token_id,
-                    None,
-                )
-
-        try:
-            session.commit()
-        except Exception:
-            session.rollback()
-
-        # -----------------------------------------
-        # 12. Current revealed set
-        # -----------------------------------------
-
-        cumulative_revealed_items = list(
-            metadata_cache.items()
-        )
+        # ====================================================
+        # 13. Current Revealed Count
+        # ====================================================
 
         cumulative_count = len(
             cumulative_revealed_items
@@ -1225,18 +1418,30 @@ async def process_collection_async(
             or 0
         )
 
-        # -----------------------------------------
-        # 13. Update Collection statistics
-        # -----------------------------------------
-
-        ensure_collection_placeholder(
-            session,
-            watched,
-            revealed_count=cumulative_count,
+        minted_supply = (
+            COLLECTION_TOTAL_SUPPLY_CACHE.get(
+                watched.id
+            )
         )
 
+        # ====================================================
+        # 14. IMPORTANT FIX
+        #
+        # اقرأ Collection قبل تحديث revealed_count.
+        #
+        # النسخة السابقة كانت:
+        #
+        # ensure_collection_placeholder()
+        # existing_collection = query(...)
+        #
+        # وهذا يجعل previous_count == cumulative_count
+        # وبالتالي لا يتم تشغيل rarity.
+        # ====================================================
+
         existing_collection = (
-            session.query(Collection)
+            session.query(
+                Collection
+            )
             .filter_by(
                 slug=watched.slug
             )
@@ -1249,14 +1454,42 @@ async def process_collection_async(
             else 0
         )
 
-        # -----------------------------------------
-        # 14. Rarity computation
-        # -----------------------------------------
+        has_rare_items = bool(
+            existing_collection
+            and len(
+                existing_collection.rare_items
+            ) > 0
+        )
 
-        if (
-            cumulative_count > previous_count
+        # ====================================================
+        # 15. Update Collection Statistics
+        # ====================================================
+
+        ensure_collection_placeholder(
+            session,
+            watched,
+            revealed_count=cumulative_count,
+        )
+
+        # ====================================================
+        # 16. Rarity Computation
+        # ====================================================
+
+        should_compute_rarity = (
+
+            cumulative_count > 0
+
+            and (
+                cumulative_count
+                > previous_count
+
+                or not has_rare_items
+            )
+
             and cumulative_revealed_items
-        ):
+        )
+
+        if should_compute_rarity:
 
             t0 = time.monotonic()
 
@@ -1278,35 +1511,25 @@ async def process_collection_async(
 
                 log.info(
                     f"[{watched.slug}] "
-                    f"Final Rarity محسوبة "
-                    f"لـ "
-                    f"{result.get('revealed_total')} "
-                    f"/ "
-                    f"{result.get('total_supply')} "
+                    f"Rarity محسوبة بنجاح: "
+                    f"{result.get('revealed_total')}"
+                    f"/"
+                    f"{result.get('total_supply', total_supply)} "
                     f"خلال "
                     f"{rarity_elapsed}s."
                 )
 
             else:
 
-                reason = result.get(
-                    "reason",
-                    "unknown",
-                )
-
                 log.info(
                     f"[{watched.slug}] "
-                    f"Rarity مؤقتة فقط: "
-                    f"{result.get('revealed_total', cumulative_count)}"
-                    f"/"
-                    f"{result.get('total_supply', total_supply)} "
-                    f"— "
-                    f"{reason}"
+                    f"Rarity لم تكتمل: "
+                    f"{result.get('reason', 'unknown')}"
                 )
 
-        # -----------------------------------------
-        # 15. Diagnostics
-        # -----------------------------------------
+        # ====================================================
+        # 17. Diagnostics
+        # ====================================================
 
         total_cycle_time = round(
             time.monotonic()
@@ -1314,13 +1537,33 @@ async def process_collection_async(
             3,
         )
 
-        log.info(
-            f"[{watched.slug}] "
-            f"Reveal={cumulative_count}/"
-            f"{total_supply} | "
-            f"new={changed_count} | "
-            f"cycle={total_cycle_time}s"
-        )
+        if minted_supply is not None:
+
+            log.info(
+                f"[{watched.slug}] "
+                f"Reveal="
+                f"{cumulative_count}/"
+                f"{total_supply} | "
+                f"Minted="
+                f"{minted_supply} | "
+                f"new="
+                f"{locals().get('changed_count', 0)} | "
+                f"cycle="
+                f"{total_cycle_time}s"
+            )
+
+        else:
+
+            log.info(
+                f"[{watched.slug}] "
+                f"Reveal="
+                f"{cumulative_count}/"
+                f"{total_supply} | "
+                f"new="
+                f"{locals().get('changed_count', 0)} | "
+                f"cycle="
+                f"{total_cycle_time}s"
+            )
 
     except Exception as exc:
 
@@ -1334,12 +1577,13 @@ async def process_collection_async(
 
         try:
             session.close()
+
         except Exception:
             pass
 
 
 # ============================================================
-# Timeout wrapper
+# Timeout Wrapper
 # ============================================================
 
 async def process_collection_with_timeout(
@@ -1367,7 +1611,8 @@ async def process_collection_with_timeout(
 
         log.exception(
             f"[{watched_id}] "
-            f"خطأ في wrapper: {exc}"
+            f"خطأ في wrapper: "
+            f"{exc}"
         )
 
 
@@ -1407,13 +1652,14 @@ async def main_async_loop():
 
             if watched_list:
 
-                # نفس سلوك النظام السابق:
-                # معالجة أول 3 Collections بالتوازي.
                 tasks = [
+
                     process_collection_with_timeout(
                         row.id
                     )
-                    for row in watched_list[:3]
+
+                    for row
+                    in watched_list[:3]
                 ]
 
                 await asyncio.gather(
@@ -1430,7 +1676,8 @@ async def main_async_loop():
         except Exception as exc:
 
             log.exception(
-                f"فشل loop الرئيسي: {exc}"
+                f"فشل loop الرئيسي: "
+                f"{exc}"
             )
 
             await asyncio.sleep(4)
@@ -1446,4 +1693,4 @@ if __name__ == "__main__":
 
     asyncio.run(
         main_async_loop()
-              )
+    )
