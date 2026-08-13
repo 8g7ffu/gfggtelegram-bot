@@ -1,5 +1,5 @@
 """
-وحدة مشتركة لجلب قطع مجموعة NFT وجلب أرخص عروض الأسعار الحية من OpenSea بدون أخطاء المقارنة.
+وحدة مشتركة لجلب قطع مجموعة NFT وجلب العروض الحية المعتمدة رسمياً من OpenSea.
 """
 
 import os
@@ -98,7 +98,8 @@ def compute_rarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict
 
 def fetch_best_listings(slug: str) -> tuple[dict, bool]:
     """
-    جلب أرخص سعر معروض فعال لكل قطعة مع معالجة حماية المقارنة بأمان لمنع تجاهل العروض الرخيصة.
+    جلب قائمة العروض الحية من OpenSea API v2 الرسمي مع إرجاع مؤشر نجاح الطلب.
+    يرجع (prices_dict, success_bool)
     """
     prices = {}
     cursor = None
@@ -133,30 +134,10 @@ def fetch_best_listings(slug: str) -> tuple[dict, bool]:
                 identifier = asset.get("identifier")
                 price_info = (listing.get("price") or {}).get("current") or {}
                 value = price_info.get("value")
-                currency = str(price_info.get("currency", "")).upper()
                 decimals = price_info.get("decimals", 18)
-
                 if identifier is not None and value is not None:
                     try:
-                        raw_val = int(value) / (10 ** decimals)
-                        tid_str = str(identifier)
-                        is_stable = any(stable in currency for stable in ("USDC", "USDT", "USD", "DAI"))
-
-                        if tid_str not in prices:
-                            if is_stable:
-                                prices[tid_str] = {"price_eth": None, "price_usd_direct": raw_val}
-                            else:
-                                prices[tid_str] = {"price_eth": raw_val, "price_usd_direct": None}
-                        else:
-                            # 🎯 مقارنة أمان محصنة لمنع TypeError
-                            if is_stable:
-                                curr_usd = prices[tid_str].get("price_usd_direct")
-                                if curr_usd is None or raw_val < curr_usd:
-                                    prices[tid_str] = {"price_eth": None, "price_usd_direct": raw_val}
-                            else:
-                                curr_eth = prices[tid_str].get("price_eth")
-                                if curr_eth is None or raw_val < curr_eth:
-                                    prices[tid_str] = {"price_eth": raw_val, "price_usd_direct": None}
+                        prices[str(identifier)] = int(value) / (10 ** decimals)
                     except Exception:
                         pass
 
@@ -250,3 +231,4 @@ def compute_collection_rarity(slug: str, progress_callback=None) -> list[dict]:
         return []
     freq = build_trait_frequency(nfts)
     return compute_rarity_scores(nfts, freq, total=len(nfts))
+
