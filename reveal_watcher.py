@@ -1,5 +1,5 @@
 """
-محرك المراقبة الجارف المباشر المزود بالاستعلام المباشر من البلوكشين للقطع المتبقية (On-Chain Fallback).
+محرك المراقبة الجارف المباشر من البلوكشين الذكي مع حماية On-Chain MaxSupply و Zero-Padding.
 """
 
 import asyncio
@@ -39,14 +39,14 @@ def is_dynamic_url(uri: str) -> bool:
 
 
 def resolve_max_supply(watched: WatchedCollection) -> int:
+    """استعلام المعروض الحقيقي المباشر من البلوكشين أولاً."""
     chain = watched.chain or "ethereum"
 
     selectors = [
+        bytes.fromhex("18160ddd"),  # totalSupply()
         bytes.fromhex("d5abeb01"),  # maxSupply()
         bytes.fromhex("d368b122"),  # MAX_SUPPLY()
         bytes.fromhex("3a4b66f1"),  # maxTokens()
-        bytes.fromhex("272b5358"),  # maxCap()
-        bytes.fromhex("18160ddd"),  # totalSupply()
     ]
 
     try:
@@ -80,16 +80,6 @@ def resolve_max_supply(watched: WatchedCollection) -> int:
     return watched.max_supply or 10000
 
 
-def get_start_token_id(watched: WatchedCollection, chain: str) -> int:
-    try:
-        res = async_batch_get_token_uris(watched.contract_address, [0], chain)
-        if res and res.get(0) is not None:
-            return 0
-    except Exception:
-        pass
-    return 1
-
-
 def ensure_tracks(session, watched: WatchedCollection) -> bool:
     latest_supply = resolve_max_supply(watched)
 
@@ -111,18 +101,15 @@ def ensure_tracks(session, watched: WatchedCollection) -> bool:
     existing_ids = {t.token_id for t in session.query(RevealTrack.token_id)
                     .filter_by(watched_id=watched.id).all()}
 
-    chain = watched.chain or "ethereum"
-    start_id = get_start_token_id(watched, chain)
-
     new_tracks = []
-    for token_id in range(start_id, start_id + watched.max_supply):
+    for token_id in range(DEFAULT_START_TOKEN_ID, DEFAULT_START_TOKEN_ID + watched.max_supply):
         if token_id not in existing_ids:
             new_tracks.append(RevealTrack(watched_id=watched.id, token_id=token_id))
 
     if new_tracks:
         session.bulk_save_objects(new_tracks)
         session.commit()
-        log.info(f"[{watched.slug}] ⚡ تم إدخال وتوسيع {len(new_tracks)} صف تتبع جديد للقطع (البداية من #{start_id}).")
+        log.info(f"[{watched.slug}] ⚡ تم إدخال وتوسيع {len(new_tracks)} صف تتبع جديد للقطع المصكوكة.")
 
     return True
 
@@ -134,8 +121,8 @@ def check_global_flag(session, watched: WatchedCollection):
         watched.global_revealed_flag = flag
         session.commit()
         if flag is not None:
-            log.info(f"[{watched.slug}] 📡 [إعلامي فقط] مؤشر من العقد ({chain}): "
-                      f"{'انكشفت' if flag else 'لسا ما انكشفت'}.")
+            log.info(f"[{watched.slug}] 📡 مؤشر معلن من العقد نفسه ({chain}): "
+                      f"{'انكشفت بالكامل' if flag else 'لسا ما انكشفت'}.")
 
 
 def detect_base_uri_pattern_smart(sample_uris: dict[int, str]) -> tuple[str | None, int]:
@@ -189,6 +176,10 @@ async def process_collection_async(watched_id: int):
         chain = watched.chain or "ethereum"
         check_global_flag(session, watched)
 
+        if watched.global_revealed_flag is False:
+            ensure_collection_placeholder(session, watched, revealed_count=0)
+            return
+
         if watched.id not in COLLECTION_METADATA_CACHE:
             COLLECTION_METADATA_CACHE[watched.id] = {}
 
@@ -202,7 +193,7 @@ async def process_collection_async(watched_id: int):
         uris_to_fetch = {}
         now = datetime.now(timezone.utc)
 
-        sample_ids = [tid for tid in [0, 1, 2, 5, 10, 20, 50, 100] if tid in tracks_by_id]
+        sample_ids = [tid for tid in [1, 2, 5, 10, 20, 50, 100] if tid in tracks_by_id]
         if not sample_ids:
             sample_ids = token_ids[:5]
 
@@ -235,22 +226,6 @@ async def process_collection_async(watched_id: int):
                         track.last_uri = uri
                         track.content_checked_at = now
                         uris_to_fetch[token_id] = uri
-
-        # 🎯 خطة الطوارئ للقطع المتبقية: جلب tokenURI المباشر من البلوكشين لكل التوكينات غير المنكشفة التي فشل نمطها
-        unresolved_ids = [tid for tid in token_ids if tid not in uris_to_fetch and not tracks_by_id[tid].revealed]
-        if unresolved_ids:
-            for i in range(0, len(unresolved_ids), BATCH_SIZE):
-                chunk = unresolved_ids[i:i + BATCH_SIZE]
-                try:
-                    uri_results = await async_batch_get_token_uris(watched.contract_address, chunk, chain)
-                    for token_id, uri in uri_results.items():
-                        if uri:
-                            track = tracks_by_id[token_id]
-                            track.last_uri = uri
-                            track.content_checked_at = now
-                            uris_to_fetch[token_id] = uri
-                except Exception:
-                    pass
 
         try:
             session.commit()
@@ -302,8 +277,8 @@ async def process_collection_async(watched_id: int):
         changed_count = 0
         for track, metadata, sig in fetched_this_cycle:
             was_revealed = track.revealed
-            is_placeholder = is_placeholder_fallback(metadata)
 
+            is_placeholder = is_placeholder_fallback(metadata)
             if watched.baseline_locked and watched.baseline_signature:
                 now_revealed = (sig != watched.baseline_signature) and not is_placeholder
             else:
@@ -337,7 +312,7 @@ async def process_collection_async(watched_id: int):
             t0 = time.monotonic()
             result = recompute_from_chain_data(session, watched, cumulative_revealed_items)
             if result.get("ok"):
-                log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة على شبكة ({chain}) بالكامل!")
+                log.info(f"[{watched.slug}] 🎯 [الترتيب النهائي] تم حساب ندرة وترتيب {result['revealed_total']} قطعة منكشفة فوراً!")
 
         total_cycle_time = round(time.monotonic() - cycle_start, 3)
         log.info(f"[{watched.slug}] ⏱️ [تشخيص] إجمالي وقت هذي الدورة كاملة: {total_cycle_time} ثانية.")
@@ -362,7 +337,7 @@ async def process_collection_with_timeout(watched_id: int):
 
 async def main_async_loop():
     init_db()
-    log.info("🚀 بدأ محرك المراقبة الجارف المباشر (On-Chain maxSupply Priority + Direct Fallback).")
+    log.info("🚀 بدأ محرك المراقبة الجارف السريع اللحظي المباشر.")
 
     while True:
         try:
@@ -386,3 +361,4 @@ async def main_async_loop():
 
 if __name__ == "__main__":
     asyncio.run(main_async_loop())
+
