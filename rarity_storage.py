@@ -64,15 +64,20 @@ def compute_tier_scaled(index: int, revealed_count: int, total_supply: int) -> s
 
 
 def extract_traits_generic(metadata: dict) -> list:
-    """استخراج مرن ومحمي 100% لكل أنواع وهياكل الـ JSON الممكنة."""
+    """استخراج مرن ومحمي لكل أنواع هياكل الميتاداتا، مع دعم القيم الصفرية."""
     if not isinstance(metadata, dict):
         return []
 
+    # بعض العقود تضع كل الميتاداتا تحت مفتاح "metadata" أو "nft"
+    inner = metadata.get("metadata") or metadata.get("nft") or metadata
+    if not isinstance(inner, dict):
+        inner = metadata
+
     raw_traits = (
-        metadata.get("traits") or
-        metadata.get("attributes") or
-        metadata.get("properties") or
-        (metadata.get("meta") or {}).get("attributes") or
+        inner.get("traits") or
+        inner.get("attributes") or
+        inner.get("properties") or
+        (inner.get("meta") or {}).get("attributes") or
         {}
     )
 
@@ -80,25 +85,44 @@ def extract_traits_generic(metadata: dict) -> list:
 
     if isinstance(raw_traits, list):
         for t in raw_traits:
-            if isinstance(t, dict):
-                t_type = str(t.get("trait_type") or t.get("name") or t.get("key") or t.get("type") or "").strip()
-                raw_val = t.get("value") or t.get("val")
-                if isinstance(raw_val, (list, tuple)):
-                    t_val = ", ".join(str(v).strip() for v in raw_val if v)
-                else:
-                    t_val = str(raw_val or "").strip()
+            if not isinstance(t, dict):
+                continue
 
-                if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
-                    valid_traits.append({"trait_type": t_type, "value": t_val})
+            # جلب اسم الصفة
+            t_type = str(
+                t.get("trait_type")
+                or t.get("name")
+                or t.get("key")
+                or t.get("type")
+                or t.get("trait")
+                or ""
+            ).strip()
+
+            # جلب قيمة الصفة مع الحفاظ على 0
+            raw_val = t.get("value")
+            if raw_val is None:
+                raw_val = t.get("val")
+            if raw_val is None:
+                raw_val = t.get("trait_value")
+
+            if isinstance(raw_val, (list, tuple)):
+                t_val = ", ".join(str(v).strip() for v in raw_val if v is not None)
+            elif isinstance(raw_val, dict):
+                t_val = str(raw_val.get("value") or raw_val.get("val") or "").strip()
+            else:
+                t_val = str(raw_val).strip()
+
+            if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
+                valid_traits.append({"trait_type": t_type, "value": t_val})
 
     elif isinstance(raw_traits, dict):
         for k, v in raw_traits.items():
             if isinstance(v, (list, tuple)):
-                v_str = ", ".join(str(x).strip() for x in v if x)
+                v_str = ", ".join(str(x).strip() for x in v if x is not None)
             elif isinstance(v, dict):
                 v_str = str(v.get("value") or v.get("val") or "").strip()
             else:
-                v_str = str(v or "").strip()
+                v_str = str(v).strip()
 
             k_str = str(k).strip()
             if k_str and v_str and not any(h in v_str.lower() for h in PLACEHOLDER_NAME_HINTS):
@@ -288,13 +312,20 @@ def compute_baseline_signature(signatures: list) -> str | None:
 
 
 def build_pseudo_nft(token_id: int, metadata: dict, watched) -> dict:
+    # لو الميتاداتا الحقيقية تحت مفتاح "metadata" أو "nft"
+    inner = metadata.get("metadata") or metadata.get("nft") or metadata
+    if not isinstance(inner, dict):
+        inner = metadata
+
+    traits = extract_traits_generic(inner)
+
     return {
         "identifier": token_id,
-        "name": metadata.get("name") or f"#{token_id}",
-        "image_url": metadata.get("image") or metadata.get("image_url", ""),
+        "name": inner.get("name") or metadata.get("name") or f"#{token_id}",
+        "image_url": inner.get("image") or inner.get("image_url", ""),
         "opensea_url": f"https://opensea.io/assets/{watched.chain}/{watched.contract_address}/{token_id}",
-        "traits": extract_traits_generic(metadata),
-        "raw_metadata": metadata,
+        "traits": traits,
+        "raw_metadata": inner,
     }
 
 
@@ -325,6 +356,12 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
 
     pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
     revealed_total = len(pseudo_nfts)
+
+    # سطر تشخيص مؤقت
+    if pseudo_nfts:
+        sample_traits = pseudo_nfts[0]["traits"]
+        print(f"[تشخيص] عدد الصفات في أول قطعة: {len(sample_traits)}")
+        print(f"[تشخيص] الصفات: {sample_traits}")
 
     # العرض الكلي الحقيقي من العقد أو من إعداد المراقبة
     total_supply = watched.max_supply or revealed_total
