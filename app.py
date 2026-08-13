@@ -1,5 +1,5 @@
 """
-تطبيق ويب (Flask) لمشروع "رادار الندرة" مع استجابة لحظية ومعالجة آمنة لعملات ETH و USDC.
+تطبيق ويب (Flask) لمشروع "رادار الندرة" مع استجابة لحظية مانعة لتعليق الصفحة.
 """
 
 import os
@@ -94,22 +94,11 @@ def api_prices():
                 continue
 
             for item in col.rare_items:
-                item_price_info = price_map_eth.get(str(item.identifier)) if isinstance(price_map_eth, dict) else None
-                price_eth = None
-                price_usd = None
+                price_eth = price_map_eth.get(str(item.identifier)) if isinstance(price_map_eth, dict) else None
+                if price_eth and price_eth > 500:
+                    price_eth = None
 
-                # 🎯 التمييز الدقيق بين عملات USDC/USDT المباشرة والإيثر ETH
-                if isinstance(item_price_info, dict):
-                    if item_price_info.get("price_usd_direct") is not None:
-                        price_usd = item_price_info["price_usd_direct"]
-                    elif item_price_info.get("price_eth") is not None:
-                        price_eth = item_price_info["price_eth"]
-                        if price_eth <= 500:
-                            price_usd = price_eth * eth_usd_rate if eth_usd_rate else None
-                elif isinstance(item_price_info, (int, float)):
-                    if item_price_info <= 500:
-                        price_eth = item_price_info
-                        price_usd = price_eth * eth_usd_rate if eth_usd_rate else None
+                price_usd = (price_eth * eth_usd_rate) if (price_eth is not None and eth_usd_rate) else None
 
                 item.price_eth = price_eth
                 item.price_usd = price_usd
@@ -216,3 +205,4 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 else:
     init_db()
+
