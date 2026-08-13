@@ -1,12 +1,12 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد (Pure Internal OpenRarity Engine).
-تزيل تماماً خلط الرتب الجزئية والتعارض الدائري وتضمن بدقة 8 خانات عشرية ترتيباً صافياً 100%.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد
+مع تحسين Bayesian Smoothing لتقدير الندرة أثناء الكشف الجزئي.
 """
 
 import hashlib
 import json
 import math
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 from models import Collection, RareItem
@@ -16,15 +16,45 @@ from rarity_core import listing_price_to_eth_usd
 ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
+# الحد الأدنى لعدد القطع المكشوفة قبل منح تصنيف Orange/Pink
+MIN_REVEALED_FOR_TIER = 50
+
 PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
 ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 
 
 def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
+    """
+    نُبقي الدالة القديمة لأي استدعاء خارجي، لكن التصنيف الفعلي أصبح
+    يتم عبر compute_tier_scaled في المسار الجديد.
+    """
     if not total or total <= 0:
         total = 1000
 
     percentile = ((index + 1) / total) * 100
+
+    if percentile <= ORANGE_PERCENT:
+        return "orange"
+    if percentile <= PINK_PERCENT:
+        return "pink"
+    return None
+
+
+def compute_tier_scaled(index: int, revealed_count: int, total_supply: int) -> str | None:
+    """
+    تحديد الـ tier بناءً على الرتبة المتوقعة في العرض الكامل.
+    نستخدم توقع الرتبة من توزيع العيّنة.
+    """
+    if revealed_count <= 0 or total_supply <= 0:
+        return None
+
+    # لا نمنح orange/pink قبل كشف عدد كافٍ من القطع
+    if revealed_count < MIN_REVEALED_FOR_TIER:
+        return None
+
+    # توقع رتبة القطعة في العرض الكامل
+    expected_rank = ((index + 0.5) / revealed_count) * total_supply
+    percentile = (expected_rank / total_supply) * 100
 
     if percentile <= ORANGE_PERCENT:
         return "orange"
@@ -89,43 +119,113 @@ def extract_opensea_official_rank(metadata: dict) -> int | None:
     return None
 
 
-def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
-    freq = {}
-    for nft in nfts:
+# =============================================================================
+# دوال الندرة الجديدة (Bayesian OpenRarity)
+# =============================================================================
+
+def estimate_full_count(observed: int, n: int, N: int, k_obs: int, alpha: float = 1.0) -> float:
+    """
+    تقدير العدد الكلي لصفة ما في العرض الكامل بناءً على العيّنة المكشوفة.
+    """
+    if n <= 0:
+        return 0.0
+
+    # احتمال بايزي للقيمة داخل العينة مع فئة Unknown
+    p = (observed + alpha) / (n + alpha * (k_obs + 1))
+
+    # العدد المتوقع في غير المكشوف + العدد الملاحظ
+    return observed + p * max(0, N - n)
+
+
+def build_bayesian_trait_estimates(pseudo_nfts: list[dict], total_supply: int, alpha: float = 1.0):
+    """
+    يبني تقديرات عددية لوجود كل صفة في العرض الكامل.
+    """
+    n = len(pseudo_nfts)
+    if n == 0:
+        return {}, {}, n
+
+    trait_counts = defaultdict(lambda: defaultdict(int))
+    trait_value_sets = defaultdict(set)
+    trait_count_freq = defaultdict(int)
+    trait_count_values = set()
+
+    for nft in pseudo_nfts:
         traits = nft.get("traits") or []
-        trait_count_str = str(len(traits))
-        freq.setdefault("Trait Count", {})
-        freq["Trait Count"][trait_count_str] = freq["Trait Count"].get(trait_count_str, 0) + 1
+        tc = len(traits)
+
+        trait_count_freq[tc] += 1
+        trait_count_values.add(tc)
 
         for trait in traits:
             t_type = trait.get("trait_type")
             t_value = trait.get("value")
             if not t_type or not t_value:
                 continue
-            freq.setdefault(t_type, {})
-            freq[t_type][t_value] = freq[t_type].get(t_value, 0) + 1
-    return freq
+            t_type = str(t_type)
+            t_value = str(t_value)
+
+            trait_counts[t_type][t_value] += 1
+            trait_value_sets[t_type].add(t_value)
+
+    # تقدير أعداد الصفات
+    estimated_traits = {}
+    for t_type, value_counts in trait_counts.items():
+        k_obs = len(trait_value_sets[t_type])
+        estimated_traits[t_type] = {}
+        for value, observed in value_counts.items():
+            estimated_traits[t_type][value] = estimate_full_count(
+                observed, n, total_supply, k_obs, alpha
+            )
+
+    # تقدير أعداد Trait Count
+    k_tc_obs = len(trait_count_values)
+    estimated_trait_counts = {}
+    for tc, observed in trait_count_freq.items():
+        estimated_trait_counts[tc] = estimate_full_count(
+            observed, n, total_supply, k_tc_obs, alpha
+        )
+
+    return estimated_traits, estimated_trait_counts, n
 
 
-def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
-    """حساب نقاط الندرة الصافية بدقة 8 خانات عشرية مع تفادي أي تعاطي خاطئ مع الرتب الخارجية."""
+def compute_bayesian_openrarity_scores(pseudo_nfts: list[dict], total_supply: int, alpha: float = 1.0) -> list[dict]:
+    """
+    حساب نقاط الندرة بطريقة OpenRarity + Bayesian.
+    total_supply هنا هو العرض الكلي للكولكشن وليس عدد القطع المكشوفة.
+    """
+    if total_supply <= 0:
+        total_supply = len(pseudo_nfts) or 1
+
+    estimated_traits, estimated_trait_counts, n = build_bayesian_trait_estimates(
+        pseudo_nfts, total_supply, alpha
+    )
+
     results = []
 
-    for nft in nfts:
+    for nft in pseudo_nfts:
         traits = nft.get("traits") or []
         score = 0.0
 
-        t_count_str = str(len(traits))
-        count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
-        score += math.log2(total / max(count_tc, 1))
+        # 1) نقاط Trait Count
+        tc = len(traits)
+        est_tc = estimated_trait_counts.get(tc, 0.0)
+        if est_tc <= 0:
+            est_tc = 1e-9
+        score += -math.log2(est_tc / total_supply)
 
+        # 2) نقاط كل صفة
         for trait in traits:
-            t_type = trait.get("trait_type")
-            t_value = trait.get("value")
+            t_type = str(trait.get("trait_type", ""))
+            t_value = str(trait.get("value", ""))
             if not t_type or not t_value:
                 continue
-            count = freq.get(t_type, {}).get(t_value, 1)
-            score += math.log2(total / max(count, 1))
+
+            est_value = estimated_traits.get(t_type, {}).get(t_value, 0.0)
+            if est_value <= 0:
+                est_value = 1e-9
+
+            score += -math.log2(est_value / total_supply)
 
         try:
             tid_num = int(nft.get("identifier", 0))
@@ -141,17 +241,14 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "rarity_score": round(score, 8),
         })
 
-    # فرز داخلي نظيف 100% حسب نقاط الندرة، مع التوكين لكسر التعادل الحتمي
+    # ترتيب دقيق حسب النقاط ثم معرف التوكين
     results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
-
-    for i, item in enumerate(results):
-        if i > 0 and item["rarity_score"] == results[i - 1]["rarity_score"]:
-            item["rank"] = results[i - 1]["rank"]
-        else:
-            item["rank"] = i + 1
-
     return results
 
+
+# =============================================================================
+# الدوال الأخرى تبقى كما هي
+# =============================================================================
 
 def content_signature(metadata: dict) -> str:
     image = metadata.get("image") or metadata.get("image_url") or ""
@@ -224,15 +321,21 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
     if not revealed_items:
         return {"ok": False, "reason": "no_revealed_yet"}
 
-    # استيراد محلي بديل داخل الدالة للوقاية التامة من أي تعارض دائري
     from rarity_core import fetch_best_listings
 
     pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
     revealed_total = len(pseudo_nfts)
+
+    # العرض الكلي الحقيقي من العقد أو من إعداد المراقبة
     total_supply = watched.max_supply or revealed_total
 
-    freq = build_trait_frequency_with_count(pseudo_nfts)
-    ranked = compute_pure_openrarity_scores(pseudo_nfts, freq, total=revealed_total)
+    # ========== استخدم الخوارزمية الجديدة ==========
+    ranked = compute_bayesian_openrarity_scores(
+        pseudo_nfts,
+        total_supply=total_supply,
+        alpha=1.0
+    )
+    # =============================================
 
     try:
         price_map_eth, _ = fetch_best_listings(watched.slug)
@@ -261,14 +364,19 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
         session.query(RareItem).filter_by(collection_id=collection.id).delete()
 
     for idx, item in enumerate(ranked):
-        tier = compute_tier(item["rank"], total_supply, index=idx)
+        # التصنيف الجديد يعتمد على الرتبة المتوقعة
+        tier = compute_tier_scaled(
+            index=idx,
+            revealed_count=revealed_total,
+            total_supply=total_supply
+        )
+
         if tier is None:
             continue
 
         listing_price = price_map_eth.get(str(item["identifier"])) if isinstance(price_map_eth, dict) else None
-        # نحوّل حسب عملة العرض الفعلية: نضرب بسعر الصرف فقط لو كانت إيثيريوم/WETH،
-        # أما العروض المسعّرة أصلاً بعملة مستقرة بالدولار (USDC وغيرها) فلا تُضرب إطلاقاً
         price_eth, price_usd = listing_price_to_eth_usd(listing_price, eth_usd_rate)
+
         if price_eth and price_eth > 500:
             price_eth = None
             price_usd = None
@@ -280,7 +388,7 @@ def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
             image_url=item.get("image_url", ""),
             opensea_url=item.get("opensea_url", ""),
             rarity_score=item["rarity_score"],
-            rank=item["rank"],
+            rank=idx + 1,
             price_eth=price_eth,
             price_usd=price_usd,
             tier=tier,
