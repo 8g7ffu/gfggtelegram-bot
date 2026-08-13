@@ -10,7 +10,7 @@ from flask import Flask, redirect, render_template, request, url_for, jsonify
 from sqlalchemy.orm import joinedload
 
 from models import Collection, WatchedCollection, RareItem, SessionLocal, init_db
-from rarity_core import fetch_contract_address, fetch_best_listings
+from rarity_core import fetch_contract_address, fetch_best_listings, listing_price_to_eth_usd
 from price_utils import get_eth_usd_rate
 
 app = Flask(__name__)
@@ -94,11 +94,12 @@ def api_prices():
                 continue
 
             for item in col.rare_items:
-                price_eth = price_map_eth.get(str(item.identifier)) if isinstance(price_map_eth, dict) else None
+                listing_price = price_map_eth.get(str(item.identifier)) if isinstance(price_map_eth, dict) else None
+                # ضرب سعر الصرف يتم فقط للعروض بعملة ETH/WETH؛ عروض الدولار المستقر تُؤخذ كما هي
+                price_eth, price_usd = listing_price_to_eth_usd(listing_price, eth_usd_rate)
                 if price_eth and price_eth > 500:
                     price_eth = None
-
-                price_usd = (price_eth * eth_usd_rate) if (price_eth is not None and eth_usd_rate) else None
+                    price_usd = None
 
                 item.price_eth = price_eth
                 item.price_usd = price_usd
@@ -205,4 +206,3 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 else:
     init_db()
-
