@@ -1,435 +1,1086 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار OpenRarity النقي الموحد
-مع تحسين Bayesian Smoothing لتقدير الندرة أثناء الكشف الجزئي.
+OpenRarity-compatible rarity engine.
+
+يعتمد على مبادئ المرجع الرسمي لـ OpenRarity:
+- Information Content
+- Collection Entropy normalization
+- Null attributes
+- Meta Trait Count
+- Double Sort:
+    1) unique_attribute_count
+    2) rarity score
+- Competition ranking (RANK)
+- عدم استخدام 999999 أو كلمات legendary/unique كعامل رياضي
+
+مهم:
+الـFinal OpenRarity rank لا يكون صالحاً إلا عندما تكون مجموعة
+البيانات المقدمة كاملة بالنسبة إلى الـcollection المراد ترتيبها.
 """
 
 import hashlib
 import json
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 
 from models import Collection, RareItem
 from price_utils import get_eth_usd_rate
 from rarity_core import listing_price_to_eth_usd
 
+
 ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
-# الحد الأدنى لعدد القطع المكشوفة قبل منح تصنيف Orange/Pink
-MIN_REVEALED_FOR_TIER = 50
+TRAIT_COUNT_ATTRIBUTE = "meta_trait:trait_count"
 
-PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
-ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
+PLACEHOLDER_NAME_HINTS = (
+    "unrevealed",
+    "hidden",
+    "mystery",
+)
 
 
-def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
+# ============================================================
+# Basic normalization
+# ============================================================
+
+def normalize_attribute_string(value) -> str:
     """
-    نُبقي الدالة القديمة لأي استدعاء خارجي، لكن التصنيف الفعلي أصبح
-    يتم عبر compute_tier_scaled في المسار الجديد.
+    OpenRarity normalizes string attribute names/values
+    so case and surrounding whitespace do not create
+    separate attributes.
     """
-    if not total or total <= 0:
-        total = 1000
+    return str(value).strip().lower()
 
-    percentile = ((index + 1) / total) * 100
 
-    if percentile <= ORANGE_PERCENT:
+# ============================================================
+# Tier
+# ============================================================
+
+def compute_tier(
+    rank: int,
+    total: int,
+) -> str | None:
+    """
+    Final tier only.
+
+    Orange = top 1%
+    Pink   = top 5%
+
+    Uses the actual rank rather than array index.
+    """
+
+    if rank is None or total is None:
+        return None
+
+    if total <= 0 or rank <= 0:
+        return None
+
+    orange_limit = max(
+        1,
+        math.ceil(total * (ORANGE_PERCENT / 100.0)),
+    )
+
+    pink_limit = max(
+        1,
+        math.ceil(total * (PINK_PERCENT / 100.0)),
+    )
+
+    if rank <= orange_limit:
         return "orange"
-    if percentile <= PINK_PERCENT:
+
+    if rank <= pink_limit:
         return "pink"
+
     return None
 
 
-def compute_tier_scaled(index: int, revealed_count: int, total_supply: int) -> str | None:
+# ============================================================
+# Metadata / Traits
+# ============================================================
+
+def extract_traits_generic(metadata: dict) -> list[dict]:
     """
-    تحديد الـ tier بناءً على الرتبة المتوقعة في العرض الكامل.
-    نستخدم توقع الرتبة من توزيع العيّنة.
+    Extract string traits from supported metadata structures.
+
+    Returns canonical:
+        [
+            {
+                "trait_type": "...",
+                "value": "..."
+            }
+        ]
+
+    Numeric/date attributes are intentionally not treated as
+    standard OpenRarity attributes because OpenRarity's current
+    reference scorer rejects numeric/date collections.
     """
-    if revealed_count <= 0 or total_supply <= 0:
-        return None
 
-    # لا نمنح orange/pink قبل كشف عدد كافٍ من القطع
-    if revealed_count < MIN_REVEALED_FOR_TIER:
-        return None
-
-    # توقع رتبة القطعة في العرض الكامل
-    expected_rank = ((index + 0.5) / revealed_count) * total_supply
-    percentile = (expected_rank / total_supply) * 100
-
-    if percentile <= ORANGE_PERCENT:
-        return "orange"
-    if percentile <= PINK_PERCENT:
-        return "pink"
-    return None
-
-
-def extract_traits_generic(metadata: dict) -> list:
-    """استخراج مرن ومحمي لكل أنواع هياكل الميتاداتا، مع دعم القيم الصفرية."""
     if not isinstance(metadata, dict):
         return []
 
-    # بعض العقود تضع كل الميتاداتا تحت مفتاح "metadata" أو "nft"
-    inner = metadata.get("metadata") or metadata.get("nft") or metadata
-    if not isinstance(inner, dict):
-        inner = metadata
-
     raw_traits = (
-        inner.get("traits") or
-        inner.get("attributes") or
-        inner.get("properties") or
-        (inner.get("meta") or {}).get("attributes") or
-        {}
+        metadata.get("traits")
+        or metadata.get("attributes")
+        or metadata.get("properties")
+        or (metadata.get("meta") or {}).get("attributes")
+        or {}
     )
 
     valid_traits = []
 
     if isinstance(raw_traits, list):
-        for t in raw_traits:
-            if not isinstance(t, dict):
+
+        for item in raw_traits:
+
+            if not isinstance(item, dict):
                 continue
 
-            # جلب اسم الصفة
-            t_type = str(
-                t.get("trait_type")
-                or t.get("name")
-                or t.get("key")
-                or t.get("type")
-                or t.get("trait")
-                or ""
-            ).strip()
+            trait_type = (
+                item.get("trait_type")
+                or item.get("name")
+                or item.get("key")
+                or item.get("type")
+            )
 
-            # جلب قيمة الصفة مع الحفاظ على 0
-            raw_val = t.get("value")
-            if raw_val is None:
-                raw_val = t.get("val")
-            if raw_val is None:
-                raw_val = t.get("trait_value")
+            raw_value = (
+                item.get("value")
+                if "value" in item
+                else item.get("val")
+            )
 
-            if isinstance(raw_val, (list, tuple)):
-                t_val = ", ".join(str(v).strip() for v in raw_val if v is not None)
-            elif isinstance(raw_val, dict):
-                t_val = str(raw_val.get("value") or raw_val.get("val") or "").strip()
-            else:
-                t_val = str(raw_val).strip()
+            # OpenRarity standard scorer is based on string attrs.
+            if not isinstance(trait_type, str):
+                continue
 
-            if t_type and t_val and not any(h in t_val.lower() for h in PLACEHOLDER_NAME_HINTS):
-                valid_traits.append({"trait_type": t_type, "value": t_val})
+            if not isinstance(raw_value, str):
+                continue
+
+            trait_type = normalize_attribute_string(trait_type)
+            value = normalize_attribute_string(raw_value)
+
+            if not trait_type or not value:
+                continue
+
+            if any(
+                hint in value
+                for hint in PLACEHOLDER_NAME_HINTS
+            ):
+                continue
+
+            valid_traits.append(
+                {
+                    "trait_type": trait_type,
+                    "value": value,
+                }
+            )
 
     elif isinstance(raw_traits, dict):
-        for k, v in raw_traits.items():
-            if isinstance(v, (list, tuple)):
-                v_str = ", ".join(str(x).strip() for x in v if x is not None)
-            elif isinstance(v, dict):
-                v_str = str(v.get("value") or v.get("val") or "").strip()
-            else:
-                v_str = str(v).strip()
 
-            k_str = str(k).strip()
-            if k_str and v_str and not any(h in v_str.lower() for h in PLACEHOLDER_NAME_HINTS):
-                valid_traits.append({"trait_type": k_str, "value": v_str})
+        for raw_type, raw_value in raw_traits.items():
+
+            if not isinstance(raw_type, str):
+                continue
+
+            # Only string values for OpenRarity-compatible scoring.
+            if not isinstance(raw_value, str):
+                continue
+
+            trait_type = normalize_attribute_string(
+                raw_type
+            )
+
+            value = normalize_attribute_string(
+                raw_value
+            )
+
+            if not trait_type or not value:
+                continue
+
+            if any(
+                hint in value
+                for hint in PLACEHOLDER_NAME_HINTS
+            ):
+                continue
+
+            valid_traits.append(
+                {
+                    "trait_type": trait_type,
+                    "value": value,
+                }
+            )
 
     return valid_traits
 
 
-def extract_opensea_official_rank(metadata: dict) -> int | None:
-    try:
-        rarity_obj = metadata.get("rarity")
-        if isinstance(rarity_obj, dict):
-            rank = rarity_obj.get("rank")
-            if rank and isinstance(rank, int) and rank > 0:
-                return rank
-    except Exception:
-        pass
-    return None
+# ============================================================
+# Trait data model
+# ============================================================
 
-
-# =============================================================================
-# دوال الندرة الجديدة (Bayesian OpenRarity)
-# =============================================================================
-
-def estimate_full_count(observed: int, n: int, N: int, k_obs: int, alpha: float = 1.0) -> float:
+def build_attribute_maps(
+    nfts: list[dict],
+) -> tuple[
+    list[dict[str, str]],
+    dict[str, dict[str, int]],
+]:
     """
-    تقدير العدد الكلي لصفة ما في العرض الكامل بناءً على العيّنة المكشوفة.
+    Build canonical per-token attributes and collection
+    frequency counts.
+
+    Every token receives the synthetic:
+        meta_trait:trait_count
+
+    exactly like the reference implementation.
     """
-    if n <= 0:
-        return 0.0
 
-    # احتمال بايزي للقيمة داخل العينة مع فئة Unknown
-    p = (observed + alpha) / (n + alpha * (k_obs + 1))
+    token_attributes = []
+    frequency = {}
 
-    # العدد المتوقع في غير المكشوف + العدد الملاحظ
-    return observed + p * max(0, N - n)
+    for nft in nfts:
 
-
-def build_bayesian_trait_estimates(pseudo_nfts: list[dict], total_supply: int, alpha: float = 1.0):
-    """
-    يبني تقديرات عددية لوجود كل صفة في العرض الكامل.
-    """
-    n = len(pseudo_nfts)
-    if n == 0:
-        return {}, {}, n
-
-    trait_counts = defaultdict(lambda: defaultdict(int))
-    trait_value_sets = defaultdict(set)
-    trait_count_freq = defaultdict(int)
-    trait_count_values = set()
-
-    for nft in pseudo_nfts:
-        traits = nft.get("traits") or []
-        tc = len(traits)
-
-        trait_count_freq[tc] += 1
-        trait_count_values.add(tc)
-
-        for trait in traits:
-            t_type = trait.get("trait_type")
-            t_value = trait.get("value")
-            if not t_type or not t_value:
-                continue
-            t_type = str(t_type)
-            t_value = str(t_value)
-
-            trait_counts[t_type][t_value] += 1
-            trait_value_sets[t_type].add(t_value)
-
-    # تقدير أعداد الصفات
-    estimated_traits = {}
-    for t_type, value_counts in trait_counts.items():
-        k_obs = len(trait_value_sets[t_type])
-        estimated_traits[t_type] = {}
-        for value, observed in value_counts.items():
-            estimated_traits[t_type][value] = estimate_full_count(
-                observed, n, total_supply, k_obs, alpha
-            )
-
-    # تقدير أعداد Trait Count
-    k_tc_obs = len(trait_count_values)
-    estimated_trait_counts = {}
-    for tc, observed in trait_count_freq.items():
-        estimated_trait_counts[tc] = estimate_full_count(
-            observed, n, total_supply, k_tc_obs, alpha
+        traits = extract_traits_generic(
+            nft.get("raw_metadata")
+            if isinstance(nft.get("raw_metadata"), dict)
+            else {
+                "attributes": nft.get("traits") or []
+            }
         )
 
-    return estimated_traits, estimated_trait_counts, n
+        attributes = {}
+
+        # Real string traits.
+        for trait in traits:
+
+            trait_type = trait["trait_type"]
+            value = trait["value"]
+
+            # Same behavior as a dictionary-backed metadata model:
+            # one value per trait type.
+            attributes[trait_type] = value
+
+        # Meta Trait Count.
+        trait_count = len(attributes)
+
+        attributes[TRAIT_COUNT_ATTRIBUTE] = str(
+            trait_count
+        )
+
+        token_attributes.append(
+            attributes
+        )
+
+        # Collection frequencies.
+        for name, value in attributes.items():
+
+            frequency.setdefault(
+                name,
+                {}
+            )
+
+            frequency[name][value] = (
+                frequency[name].get(value, 0)
+                + 1
+            )
+
+    return token_attributes, frequency
 
 
-def compute_bayesian_openrarity_scores(pseudo_nfts: list[dict], total_supply: int, alpha: float = 1.0) -> list[dict]:
+# ============================================================
+# Null attributes
+# ============================================================
+
+def build_null_attribute_counts(
+    frequency: dict[str, dict[str, int]],
+    total: int,
+) -> dict[str, int]:
     """
-    حساب نقاط الندرة بطريقة OpenRarity + Bayesian.
-    total_supply هنا هو العرض الكلي للكولكشن وليس عدد القطع المكشوفة.
-    """
-    if total_supply <= 0:
-        total_supply = len(pseudo_nfts) or 1
+    For every attribute category:
 
-    estimated_traits, estimated_trait_counts, n = build_bayesian_trait_estimates(
-        pseudo_nfts, total_supply, alpha
+        Null = total - sum(all explicit values)
+
+    Exactly the behavior used by OpenRarity's Collection model.
+    """
+
+    null_counts = {}
+
+    for attribute_name, value_counts in frequency.items():
+
+        explicit_count = sum(
+            value_counts.values()
+        )
+
+        missing = total - explicit_count
+
+        if missing > 0:
+            null_counts[
+                attribute_name
+            ] = missing
+
+    return null_counts
+
+
+# ============================================================
+# Collection entropy
+# ============================================================
+
+def compute_collection_entropy(
+    frequency: dict[str, dict[str, int]],
+    null_counts: dict[str, int],
+    total: int,
+) -> float:
+    """
+    H = -Σ p log2(p)
+
+    Includes explicit attribute values and Null values.
+    """
+
+    if total <= 0:
+        return 0.0
+
+    entropy = 0.0
+
+    for attribute_name, value_counts in frequency.items():
+
+        counts = list(
+            value_counts.values()
+        )
+
+        if attribute_name in null_counts:
+            counts.append(
+                null_counts[attribute_name]
+            )
+
+        for count in counts:
+
+            if count <= 0:
+                continue
+
+            probability = (
+                count / total
+            )
+
+            entropy -= (
+                probability
+                * math.log2(probability)
+            )
+
+    return entropy
+
+
+# ============================================================
+# Token score
+# ============================================================
+
+def compute_token_information_score(
+    attributes: dict[str, str],
+    frequency: dict[str, dict[str, int]],
+    null_counts: dict[str, int],
+    total: int,
+) -> float:
+    """
+    Raw Information Content:
+
+        Σ log2(N / count(attribute))
+    """
+
+    if total <= 0:
+        return 0.0
+
+    score = 0.0
+
+    # Iterate through every attribute category known
+    # to the collection.
+
+    for attribute_name, value_counts in frequency.items():
+
+        if attribute_name in attributes:
+
+            value = attributes[attribute_name]
+
+            count = (
+                value_counts.get(
+                    value,
+                    0,
+                )
+            )
+
+        else:
+
+            count = null_counts.get(
+                attribute_name,
+                0,
+            )
+
+        if count <= 0:
+            continue
+
+        score += math.log2(
+            total / count
+        )
+
+    return score
+
+
+# ============================================================
+# Unique attribute count
+# ============================================================
+
+def compute_unique_attribute_count(
+    attributes: dict[str, str],
+    frequency: dict[str, dict[str, int]],
+) -> int:
+    """
+    OpenRarity Double Sort feature.
+
+    Count how many attribute name/value pairs are globally
+    unique in the collection.
+    """
+
+    unique_count = 0
+
+    for name, value in attributes.items():
+
+        count = (
+            frequency
+            .get(name, {})
+            .get(value, 0)
+        )
+
+        if count == 1:
+            unique_count += 1
+
+    return unique_count
+
+
+# ============================================================
+# Main OpenRarity score engine
+# ============================================================
+
+def compute_pure_openrarity_scores(
+    nfts: list[dict],
+    freq: dict | None = None,
+    total: int | None = None,
+) -> list[dict]:
+    """
+    OpenRarity-compatible scoring and ranking.
+
+    Important:
+    The supplied nfts must represent the complete collection
+    if the caller wants a final rank matching OpenSea.
+
+    This function intentionally does NOT:
+    - use 999999
+    - inspect "legendary"
+    - inspect "1/1"
+    - use token name as rarity
+    - use token ID as a rarity signal
+    - divide by number of traits
+    """
+
+    if not nfts:
+        return []
+
+    actual_total = len(nfts)
+
+    # OpenRarity derives collection total from its token set.
+    if total is None or total != actual_total:
+        total = actual_total
+
+    token_attributes, derived_frequency = (
+        build_attribute_maps(nfts)
     )
+
+    frequency = derived_frequency
+
+    null_counts = build_null_attribute_counts(
+        frequency,
+        total,
+    )
+
+    collection_entropy = compute_collection_entropy(
+        frequency,
+        null_counts,
+        total,
+    )
+
+    if collection_entropy <= 0:
+        collection_entropy = 1.0
 
     results = []
 
-    for nft in pseudo_nfts:
-        traits = nft.get("traits") or []
-        score = 0.0
+    for index, nft in enumerate(nfts):
 
-        # 1) نقاط Trait Count
-        tc = len(traits)
-        est_tc = estimated_trait_counts.get(tc, 0.0)
-        if est_tc <= 0:
-            est_tc = 1e-9
-        score += -math.log2(est_tc / total_supply)
+        attributes = token_attributes[index]
 
-        # 2) نقاط كل صفة
-        for trait in traits:
-            t_type = str(trait.get("trait_type", ""))
-            t_value = str(trait.get("value", ""))
-            if not t_type or not t_value:
-                continue
+        raw_ic = compute_token_information_score(
+            attributes,
+            frequency,
+            null_counts,
+            total,
+        )
 
-            est_value = estimated_traits.get(t_type, {}).get(t_value, 0.0)
-            if est_value <= 0:
-                est_value = 1e-9
+        normalized_score = (
+            raw_ic / collection_entropy
+        )
 
-            score += -math.log2(est_value / total_supply)
+        unique_attribute_count = (
+            compute_unique_attribute_count(
+                attributes,
+                frequency,
+            )
+        )
 
         try:
-            tid_num = int(nft.get("identifier", 0))
-        except Exception:
+            tid_num = int(
+                nft.get("identifier", 0)
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
             tid_num = 0
 
-        results.append({
-            "identifier": nft.get("identifier"),
-            "tid_num": tid_num,
-            "name": nft.get("name") or f"#{nft.get('identifier')}",
-            "opensea_url": nft.get("opensea_url", ""),
-            "image_url": nft.get("image_url", ""),
-            "rarity_score": round(score, 8),
-        })
+        results.append(
+            {
+                "identifier": nft.get(
+                    "identifier"
+                ),
+                "tid_num": tid_num,
+                "name": (
+                    nft.get("name")
+                    or f"#{nft.get('identifier')}"
+                ),
+                "opensea_url": nft.get(
+                    "opensea_url",
+                    "",
+                ),
+                "image_url": nft.get(
+                    "image_url",
+                    "",
+                ),
+                # Keep full precision internally.
+                "rarity_score": float(
+                    normalized_score
+                ),
+                "raw_information_content": float(
+                    raw_ic
+                ),
+                "unique_attribute_count": (
+                    unique_attribute_count
+                ),
+            }
+        )
 
-    # ترتيب دقيق حسب النقاط ثم معرف التوكين
-    results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
+    # ========================================================
+    # OpenRarity Double Sort
+    #
+    # Primary:
+    #   unique_attribute_count
+    #
+    # Secondary:
+    #   score
+    #
+    # Both descending.
+    # ========================================================
+
+    results.sort(
+        key=lambda item: (
+            item[
+                "unique_attribute_count"
+            ],
+            item[
+                "rarity_score"
+            ],
+        ),
+        reverse=True,
+    )
+
+    # ========================================================
+    # Competition ranking (RANK)
+    #
+    # 1, 2, 2, 2, 5
+    #
+    # OpenRarity uses math.isclose for score equality.
+    # ========================================================
+
+    previous = None
+
+    for index, item in enumerate(
+        results
+    ):
+
+        if previous is None:
+
+            rank = 1
+
+        else:
+
+            same_unique_count = (
+                item[
+                    "unique_attribute_count"
+                ]
+                ==
+                previous[
+                    "unique_attribute_count"
+                ]
+            )
+
+            scores_equal = math.isclose(
+                item["rarity_score"],
+                previous["rarity_score"],
+            )
+
+            if (
+                same_unique_count
+                and scores_equal
+            ):
+                rank = previous["rank"]
+            else:
+                rank = index + 1
+
+        item["rank"] = rank
+        previous = item
+
+    # Round only AFTER ranking.
+    for item in results:
+
+        item["rarity_score"] = round(
+            item["rarity_score"],
+            8,
+        )
+
     return results
 
 
-# =============================================================================
-# الدوال الأخرى تبقى كما هي
-# =============================================================================
+# ============================================================
+# Metadata signature
+# ============================================================
 
-def content_signature(metadata: dict) -> str:
-    image = metadata.get("image") or metadata.get("image_url") or ""
-    traits = extract_traits_generic(metadata)
-    normalized_traits = sorted((t["trait_type"], str(t["value"])) for t in traits)
-    raw = json.dumps({"image": image, "traits": normalized_traits}, sort_keys=True)
-    return hashlib.sha256(raw.encode()).hexdigest()
+def content_signature(
+    metadata: dict,
+) -> str:
+
+    image = (
+        metadata.get("image")
+        or metadata.get("image_url")
+        or ""
+    )
+
+    traits = extract_traits_generic(
+        metadata
+    )
+
+    normalized_traits = sorted(
+        (
+            t["trait_type"],
+            t["value"],
+        )
+        for t in traits
+    )
+
+    raw = json.dumps(
+        {
+            "image": image,
+            "traits": normalized_traits,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+    return hashlib.sha256(
+        raw.encode()
+    ).hexdigest()
 
 
-def is_placeholder_fallback(metadata: dict) -> bool:
-    if not isinstance(metadata, dict) or not metadata:
+# ============================================================
+# Placeholder detection
+# ============================================================
+
+def is_placeholder_fallback(
+    metadata: dict,
+) -> bool:
+
+    if not isinstance(
+        metadata,
+        dict,
+    ) or not metadata:
+
         return True
 
-    name = str(metadata.get("name", "")).lower()
-    if any(hint in name for hint in PLACEHOLDER_NAME_HINTS):
+    name = str(
+        metadata.get(
+            "name",
+            "",
+        )
+    ).lower()
+
+    if any(
+        hint in name
+        for hint in PLACEHOLDER_NAME_HINTS
+    ):
         return True
 
-    image = str(metadata.get("image") or metadata.get("image_url") or "").lower()
-    if any(hint in image for hint in PLACEHOLDER_NAME_HINTS):
+    image = str(
+        metadata.get("image")
+        or metadata.get("image_url")
+        or ""
+    ).lower()
+
+    if any(
+        hint in image
+        for hint in PLACEHOLDER_NAME_HINTS
+    ):
         return True
 
-    traits = extract_traits_generic(metadata)
-    if not traits and not metadata.get("image") and not metadata.get("image_url"):
+    traits = extract_traits_generic(
+        metadata
+    )
+
+    if (
+        not traits
+        and not metadata.get("image")
+        and not metadata.get("image_url")
+    ):
         return True
 
     return False
 
 
-def compute_baseline_signature(signatures: list) -> str | None:
+# ============================================================
+# Baseline
+# ============================================================
+
+def compute_baseline_signature(
+    signatures: list,
+) -> str | None:
+
     if len(signatures) < 15:
         return None
-    counter = Counter(signatures)
-    most_common_sig, count = counter.most_common(1)[0]
-    if count / len(signatures) < 0.5:
+
+    counter = Counter(
+        signatures
+    )
+
+    most_common_sig, count = (
+        counter.most_common(1)[0]
+    )
+
+    if (
+        count / len(signatures)
+        < 0.5
+    ):
         return None
+
     return most_common_sig
 
 
-def build_pseudo_nft(token_id: int, metadata: dict, watched) -> dict:
-    # لو الميتاداتا الحقيقية تحت مفتاح "metadata" أو "nft"
-    inner = metadata.get("metadata") or metadata.get("nft") or metadata
-    if not isinstance(inner, dict):
-        inner = metadata
+# ============================================================
+# Pseudo NFT
+# ============================================================
 
-    traits = extract_traits_generic(inner)
+def build_pseudo_nft(
+    token_id: int,
+    metadata: dict,
+    watched,
+) -> dict:
 
     return {
         "identifier": token_id,
-        "name": inner.get("name") or metadata.get("name") or f"#{token_id}",
-        "image_url": inner.get("image") or inner.get("image_url", ""),
-        "opensea_url": f"https://opensea.io/assets/{watched.chain}/{watched.contract_address}/{token_id}",
-        "traits": traits,
-        "raw_metadata": inner,
+        "name": (
+            metadata.get("name")
+            or f"#{token_id}"
+        ),
+        "image_url": (
+            metadata.get("image")
+            or metadata.get(
+                "image_url",
+                "",
+            )
+        ),
+        "opensea_url": (
+            f"https://opensea.io/assets/"
+            f"{watched.chain}/"
+            f"{watched.contract_address}/"
+            f"{token_id}"
+        ),
+        "traits": extract_traits_generic(
+            metadata
+        ),
+        "raw_metadata": metadata,
     }
 
 
-def ensure_collection_placeholder(session, watched, revealed_count: int = 0):
-    existing = session.query(Collection).filter_by(slug=watched.slug).first()
+# ============================================================
+# Collection persistence
+# ============================================================
+
+def ensure_collection_placeholder(
+    session,
+    watched,
+    revealed_count: int = 0,
+):
+
+    existing = (
+        session.query(Collection)
+        .filter_by(
+            slug=watched.slug
+        )
+        .first()
+    )
+
     if existing:
-        existing.revealed_count = revealed_count
-        existing.total_items = watched.max_supply or existing.total_items
-        existing.computed_at = datetime.now(timezone.utc)
+
+        existing.revealed_count = (
+            revealed_count
+        )
+
+        existing.total_items = (
+            watched.max_supply
+            or existing.total_items
+        )
+
+        existing.computed_at = (
+            datetime.now(timezone.utc)
+        )
+
     else:
-        session.add(Collection(
-            slug=watched.slug,
-            name=watched.slug,
-            chain=watched.chain,
-            total_items=watched.max_supply or 0,
-            revealed_count=revealed_count,
-            opensea_url=f"https://opensea.io/collection/{watched.slug}",
-            computed_at=datetime.now(timezone.utc),
-        ))
+
+        session.add(
+            Collection(
+                slug=watched.slug,
+                name=watched.slug,
+                chain=watched.chain,
+                total_items=(
+                    watched.max_supply
+                    or 0
+                ),
+                revealed_count=(
+                    revealed_count
+                ),
+                opensea_url=(
+                    "https://opensea.io/"
+                    f"collection/{watched.slug}"
+                ),
+                computed_at=(
+                    datetime.now(timezone.utc)
+                ),
+            )
+        )
+
     session.commit()
 
 
-def recompute_from_chain_data(session, watched, revealed_items: list) -> dict:
+# ============================================================
+# Main recompute
+# ============================================================
+
+def recompute_from_chain_data(
+    session,
+    watched,
+    revealed_items: list,
+) -> dict:
+
     if not revealed_items:
-        return {"ok": False, "reason": "no_revealed_yet"}
+        return {
+            "ok": False,
+            "reason": "no_revealed_yet",
+        }
 
-    from rarity_core import fetch_best_listings
-
-    pseudo_nfts = [build_pseudo_nft(tid, meta, watched) for tid, meta in revealed_items]
-    revealed_total = len(pseudo_nfts)
-
-    # سطر تشخيص مؤقت
-    if pseudo_nfts:
-        sample_traits = pseudo_nfts[0]["traits"]
-        print(f"[تشخيص] عدد الصفات في أول قطعة: {len(sample_traits)}")
-        print(f"[تشخيص] الصفات: {sample_traits}")
-
-    # العرض الكلي الحقيقي من العقد أو من إعداد المراقبة
-    total_supply = watched.max_supply or revealed_total
-
-    # ========== استخدم الخوارزمية الجديدة ==========
-    ranked = compute_bayesian_openrarity_scores(
-        pseudo_nfts,
-        total_supply=total_supply,
-        alpha=1.0
+    from rarity_core import (
+        fetch_best_listings,
     )
-    # =============================================
+
+    pseudo_nfts = [
+        build_pseudo_nft(
+            tid,
+            meta,
+            watched,
+        )
+        for tid, meta in revealed_items
+    ]
+
+    revealed_total = len(
+        pseudo_nfts
+    )
+
+    total_supply = (
+        watched.max_supply
+        or revealed_total
+    )
+
+    # IMPORTANT:
+    # The OpenRarity final rank requires the full
+    # collection dataset.
+    is_complete = (
+        total_supply > 0
+        and revealed_total >= total_supply
+    )
+
+    ranked = compute_pure_openrarity_scores(
+        pseudo_nfts,
+        total=revealed_total,
+    )
 
     try:
-        price_map_eth, _ = fetch_best_listings(watched.slug)
+
+        price_map, _ = (
+            fetch_best_listings(
+                watched.slug
+            )
+        )
+
     except Exception:
-        price_map_eth = {}
 
-    eth_usd_rate = get_eth_usd_rate()
+        price_map = {}
 
-    collection = session.query(Collection).filter_by(slug=watched.slug).first()
+    eth_usd_rate = (
+        get_eth_usd_rate()
+    )
+
+    collection = (
+        session.query(Collection)
+        .filter_by(
+            slug=watched.slug
+        )
+        .first()
+    )
+
     if not collection:
+
         collection = Collection(
             slug=watched.slug,
             name=watched.slug,
             chain=watched.chain,
             total_items=total_supply,
             revealed_count=revealed_total,
-            opensea_url=f"https://opensea.io/collection/{watched.slug}",
-            computed_at=datetime.now(timezone.utc),
+            opensea_url=(
+                "https://opensea.io/"
+                f"collection/{watched.slug}"
+            ),
+            computed_at=(
+                datetime.now(timezone.utc)
+            ),
         )
-        session.add(collection)
+
+        session.add(
+            collection
+        )
+
         session.flush()
-    else:
-        collection.revealed_count = revealed_total
-        collection.total_items = total_supply
-        collection.computed_at = datetime.now(timezone.utc)
-        session.query(RareItem).filter_by(collection_id=collection.id).delete()
 
-    for idx, item in enumerate(ranked):
-        # التصنيف الجديد يعتمد على الرتبة المتوقعة
-        tier = compute_tier_scaled(
-            index=idx,
-            revealed_count=revealed_total,
-            total_supply=total_supply
+    else:
+
+        collection.revealed_count = (
+            revealed_total
         )
 
-        if tier is None:
+        collection.total_items = (
+            total_supply
+        )
+
+        collection.computed_at = (
+            datetime.now(timezone.utc)
+        )
+
+        session.query(RareItem).filter_by(
+            collection_id=collection.id
+        ).delete()
+
+    saved_count = 0
+
+    for item in ranked:
+
+        # NEVER present a partial ranking as a final
+        # OpenSea-compatible tier.
+        tier = (
+            compute_tier(
+                item["rank"],
+                total_supply,
+            )
+            if is_complete
+            else None
+        )
+
+        # During partial reveal we do not create
+        # final-tier RareItems.
+        if not is_complete:
             continue
 
-        listing_price = price_map_eth.get(str(item["identifier"])) if isinstance(price_map_eth, dict) else None
-        price_eth, price_usd = listing_price_to_eth_usd(listing_price, eth_usd_rate)
+        listing_price = (
+            price_map.get(
+                str(item["identifier"])
+            )
+            if isinstance(
+                price_map,
+                dict,
+            )
+            else None
+        )
 
-        if price_eth and price_eth > 500:
+        (
+            price_eth,
+            price_usd,
+        ) = listing_price_to_eth_usd(
+            listing_price,
+            eth_usd_rate,
+        )
+
+        if (
+            price_eth is not None
+            and price_eth > 500
+        ):
             price_eth = None
             price_usd = None
 
-        session.add(RareItem(
-            collection_id=collection.id,
-            identifier=str(item["identifier"]),
-            name=item["name"],
-            image_url=item.get("image_url", ""),
-            opensea_url=item.get("opensea_url", ""),
-            rarity_score=item["rarity_score"],
-            rank=idx + 1,
-            price_eth=price_eth,
-            price_usd=price_usd,
-            tier=tier,
-        ))
+        session.add(
+            RareItem(
+                collection_id=collection.id,
+                identifier=str(
+                    item["identifier"]
+                ),
+                name=item["name"],
+                image_url=item.get(
+                    "image_url",
+                    "",
+                ),
+                opensea_url=item.get(
+                    "opensea_url",
+                    "",
+                ),
+                rarity_score=item[
+                    "rarity_score"
+                ],
+                rank=item["rank"],
+                price_eth=price_eth,
+                price_usd=price_usd,
+                tier=tier,
+            )
+        )
+
+        saved_count += 1
 
     session.commit()
-    return {"ok": True, "revealed_total": revealed_total}
+
+    if not is_complete:
+
+        return {
+            "ok": False,
+            "reason": "partial_collection",
+            "revealed_total": revealed_total,
+            "total_supply": total_supply,
+            "message": (
+                "Metadata is incomplete; "
+                "final OpenRarity rank cannot be "
+                "claimed yet."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "revealed_total": revealed_total,
+        "total_supply": total_supply,
+        "saved_count": saved_count,
+        "ranking_method": (
+            "openrarity_reference_compatible"
+        ),
+    }
