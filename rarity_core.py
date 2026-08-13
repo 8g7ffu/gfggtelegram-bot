@@ -10,6 +10,38 @@ import requests
 OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "")
 PAGE_LIMIT = 200
 
+# العملات المعادلة للإيثيريوم (تحتاج ضرب بسعر الصرف لتحويلها لدولار)
+ETH_LIKE_CURRENCIES = {"ETH", "WETH"}
+# عملات مستقرة مربوطة بالدولار فعلياً (سعرها بالفعل بالدولار، لا يجوز ضربها بسعر صرف الإيثيريوم)
+USD_STABLE_CURRENCIES = {"USDC", "USDT", "DAI", "BUSD", "USD"}
+
+
+def listing_price_to_eth_usd(listing_price: dict | None, eth_usd_rate: float | None):
+    """
+    يحوّل عنصر سعر واحد (amount + currency) إلى (price_eth, price_usd) بأمان.
+    - لو العملة ETH/WETH: نحسب price_usd بضرب amount في سعر الصرف الحي.
+    - لو العملة عملة مستقرة بالدولار (USDC/USDT/...): نعتبر amount هو price_usd مباشرة
+      بدون أي ضرب بسعر صرف الإيثيريوم (هذا هو إصلاح المشكلة السابقة).
+    - أي عملة أخرى غير معروفة: لا نخمّن التحويل ونرجع (None, None) تفادياً لسعر خاطئ.
+    """
+    if not listing_price:
+        return None, None
+
+    amount = listing_price.get("amount")
+    currency = str(listing_price.get("currency") or "").upper()
+    if amount is None:
+        return None, None
+
+    if currency in ETH_LIKE_CURRENCIES:
+        price_eth = amount
+        price_usd = (price_eth * eth_usd_rate) if eth_usd_rate else None
+        return price_eth, price_usd
+
+    if currency in USD_STABLE_CURRENCIES:
+        return None, amount
+
+    return None, None
+
 
 def fetch_all_nfts(slug: str, progress_callback=None) -> list[dict]:
     all_nfts = []
@@ -135,9 +167,12 @@ def fetch_best_listings(slug: str) -> tuple[dict, bool]:
                 price_info = (listing.get("price") or {}).get("current") or {}
                 value = price_info.get("value")
                 decimals = price_info.get("decimals", 18)
+                # نلتقط رمز العملة الفعلي من OpenSea بدل افتراض أنها إيثيريوم دائماً
+                currency = str(price_info.get("currency") or "ETH").upper()
                 if identifier is not None and value is not None:
                     try:
-                        prices[str(identifier)] = int(value) / (10 ** decimals)
+                        amount = int(value) / (10 ** decimals)
+                        prices[str(identifier)] = {"amount": amount, "currency": currency}
                     except Exception:
                         pass
 
@@ -231,4 +266,3 @@ def compute_collection_rarity(slug: str, progress_callback=None) -> list[dict]:
         return []
     freq = build_trait_frequency(nfts)
     return compute_rarity_scores(nfts, freq, total=len(nfts))
-
