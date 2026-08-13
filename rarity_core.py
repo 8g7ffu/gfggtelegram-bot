@@ -1,5 +1,5 @@
 """
-وحدة مشتركة لجلب قطع مجموعة NFT وجلب أرخص عروض الأسعار الحية من OpenSea.
+وحدة مشتركة لجلب قطع مجموعة NFT وجلب أرخص عروض الأسعار الحية من OpenSea بدون أخطاء المقارنة.
 """
 
 import os
@@ -98,7 +98,7 @@ def compute_rarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict
 
 def fetch_best_listings(slug: str) -> tuple[dict, bool]:
     """
-    جلب أرخص سعر معروض فعال لكل قطعة لحل مشكلة الأسعار القديمة المرتفعة.
+    جلب أرخص سعر معروض فعال لكل قطعة مع معالجة حماية المقارنة بأمان لمنع تجاهل العروض الرخيصة.
     """
     prices = {}
     cursor = None
@@ -140,14 +140,23 @@ def fetch_best_listings(slug: str) -> tuple[dict, bool]:
                     try:
                         raw_val = int(value) / (10 ** decimals)
                         tid_str = str(identifier)
+                        is_stable = any(stable in currency for stable in ("USDC", "USDT", "USD", "DAI"))
 
-                        # 🎯 تصفية جالبة لأرخص سعر معروض فعال دائماً
-                        if any(stable in currency for stable in ("USDC", "USDT", "USD", "DAI")):
-                            if tid_str not in prices or raw_val < prices[tid_str].get("price_usd_direct", 999999):
+                        if tid_str not in prices:
+                            if is_stable:
                                 prices[tid_str] = {"price_eth": None, "price_usd_direct": raw_val}
-                        else:
-                            if tid_str not in prices or (prices[tid_str].get("price_eth") and raw_val < prices[tid_str]["price_eth"]):
+                            else:
                                 prices[tid_str] = {"price_eth": raw_val, "price_usd_direct": None}
+                        else:
+                            # 🎯 مقارنة أمان محصنة لمنع TypeError
+                            if is_stable:
+                                curr_usd = prices[tid_str].get("price_usd_direct")
+                                if curr_usd is None or raw_val < curr_usd:
+                                    prices[tid_str] = {"price_eth": None, "price_usd_direct": raw_val}
+                            else:
+                                curr_eth = prices[tid_str].get("price_eth")
+                                if curr_eth is None or raw_val < curr_eth:
+                                    prices[tid_str] = {"price_eth": raw_val, "price_usd_direct": None}
                     except Exception:
                         pass
 
