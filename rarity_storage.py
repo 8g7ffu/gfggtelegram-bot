@@ -1,5 +1,6 @@
 """
-وحدة حساب وحفظ نتائج الندرة المعتمدة على معيار Pure OpenRarity الخالي من قسرة الـ 999999 المسببة للقفزات.
+وحدة حساب وحفظ نتائج الندرة المعتمدة على النسخة المضمونة الناجحة (Pure Internal OpenRarity Engine).
+تعتمد تماماً على كودك القديم الناجح مع إضافة معالجة تسعير USDC.
 """
 
 import hashlib
@@ -15,6 +16,7 @@ ORANGE_PERCENT = 1.0
 PINK_PERCENT = 5.0
 
 PLACEHOLDER_NAME_HINTS = ("unrevealed", "hidden", "mystery")
+ONE_OF_ONE_KEYWORDS = ("1/1", "1 of 1", "one of one", "legendary", "custom", "unique")
 
 
 def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
@@ -31,6 +33,7 @@ def compute_tier(rank: int, total: int, index: int = 0) -> str | None:
 
 
 def extract_traits_generic(metadata: dict) -> list:
+    """استخراج مرن ومحمي 100% لكل أنواع وهياكل الـ JSON الممكنة."""
     if not isinstance(metadata, dict):
         return []
 
@@ -104,21 +107,17 @@ def build_trait_frequency_with_count(nfts: list[dict]) -> dict:
 
 
 def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> list[dict]:
-    """
-    حساب نقاط الانتروبيا اللوغاريتمية الصافية دون فرض 999999 ودون قفزات مفاجئة.
-    """
+    """حساب نقاط الندرة الصافية بدقة 8 خانات عشرية بنفس منطق كودك الناجح تماماً."""
     results = []
 
     for nft in nfts:
         traits = nft.get("traits") or []
         score = 0.0
 
-        # 1. انتروبيا عدد الخصائص
         t_count_str = str(len(traits))
         count_tc = freq.get("Trait Count", {}).get(t_count_str, 1)
         score += math.log2(total / max(count_tc, 1))
 
-        # 2. انتروبيا الخصائص اللوغاريتمية المباشرة
         for trait in traits:
             t_type = trait.get("trait_type")
             t_value = trait.get("value")
@@ -141,7 +140,7 @@ def compute_pure_openrarity_scores(nfts: list[dict], freq: dict, total: int) -> 
             "rarity_score": round(score, 8),
         })
 
-    # فرز تنازلي حسب السكور اللوغاريتمي الصافي
+    # فرز نظيف 100% حسب نقاط الندرة، مع كسر التعادل الحتمي برقم التوكين
     results.sort(key=lambda x: (-x["rarity_score"], x["tid_num"]))
 
     for i, item in enumerate(results):
